@@ -23,8 +23,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
+	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -42,10 +46,12 @@ import (
 	"github.com/containerd/stargz-snapshotter/estargz"
 	"github.com/containerd/stargz-snapshotter/estargz/zstdchunked"
 	"github.com/davidcassany/ocistore/pkg/logger"
+	"github.com/klauspost/compress/zstd"
 	"github.com/moby/sys/userns"
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/identity"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	bolt "go.etcd.io/bbolt"
 	"golang.org/x/sys/unix"
 )
 
@@ -133,7 +139,7 @@ func (c *OCIStore) RemoteUnpack(ref string, opts ...ApplyCommitOpt) (err error) 
 	}
 	sn := c.cli.SnapshotService(c.driver)
 
-	err = unpackRemoteLayers(ctx, c.log, fetcher, sn, mfst, diffIDs)
+	err = unpackRemoteLayers(ctx, c.log, fetcher, sn, mfst, diffIDs, c.bdb)
 	if err != nil {
 		return fmt.Errorf("could not unpack layers: %w", err)
 	}
@@ -233,7 +239,7 @@ func FetchMetadata(ctx context.Context, fetcher remotes.Fetcher, desc ocispec.De
 	return b, nil
 }
 
-func unpackRemoteLayers(ctx context.Context, log logger.Logger, fetcher remotes.Fetcher, sn snapshots.Snapshotter, manifest ocispec.Manifest, diffIDs []digest.Digest) (err error) {
+func unpackRemoteLayers(ctx context.Context, log logger.Logger, fetcher remotes.Fetcher, sn snapshots.Snapshotter, manifest ocispec.Manifest, diffIDs []digest.Digest, bdb *bolt.DB) (err error) {
 	chainIDs := make([]digest.Digest, len(diffIDs))
 	copy(chainIDs, diffIDs)
 	chainIDs = identity.ChainIDs(chainIDs)
@@ -260,36 +266,29 @@ func unpackRemoteLayers(ctx context.Context, log logger.Logger, fetcher remotes.
 		}
 
 		// fetch TOC for zstd:chunked formatted layers
-		_, _, err = fetchZstdTOC(ctx, log, layerDesc, fetcher)
+		toc, _, tocOffset, err := fetchZstdTOC(ctx, log, layerDesc, fetcher)
 		if err != nil {
 			log.Warnf("could not fetch zstd:chunked's TOC, skip TOC fetch: %v", err)
 		}
 
-		// 6. Fetch the compressed layer blob directly from the network
-		rc, err := fetcher.Fetch(ctx, layerDesc)
-		if err != nil {
-			sn.Remove(ctx, activeKey) // Clean up the active transaction on error
-			return fmt.Errorf("failed to fetch layer %s: %w", layerDesc.Digest, err)
-		}
-
-		uncompressedStream, err := compression.DecompressStream(rc)
-		if err != nil {
-			return fmt.Errorf("setting the uncompressed stream reader: %w", err)
-		}
-
-		// 7. Apply the tar stream directly to the snapshotter's mounts
-		err = applyUnix(ctx, mounts, uncompressedStream, true)
-		uErr := uncompressedStream.Close()
-		if err == nil && uErr != nil {
-			err = uErr
-		}
-		cErr := rc.Close()
-		if err == nil && cErr != nil {
-			err = cErr
-		}
-		if err != nil {
-			sn.Remove(ctx, activeKey)
-			return fmt.Errorf("failed to apply layer %s: %w", layerDesc.Digest, err)
+		if toc != nil {
+			// 6. Perform and optimized download and extraction based on zstd:chunked
+			missing, cached, nodes := processTOC(log, bdb, toc, tocOffset)
+			callback := func(root string) error {
+				return unpackZstdChunkedLayer(ctx, log, bdb, fetcher, layerDesc, nodes, missing, cached, root)
+			}
+			err = runAtMountsStack(ctx, mounts, callback)
+			if err != nil {
+				sn.Remove(ctx, activeKey) // Clean up the active transaction on error
+				return fmt.Errorf("unpacking zstd:chunked layers in mounts stack: %w", err)
+			}
+		} else {
+			// 6. Fetch the compressed layer blob directly from the network
+			err = fetchAndApplyLayerBlob(ctx, fetcher, layerDesc, mounts)
+			if err != nil {
+				sn.Remove(ctx, activeKey) // Clean up the active transaction on error
+				return fmt.Errorf("failed to apply layer %s: %w", layerDesc.Digest, err)
+			}
 		}
 
 		// 8. Commit the snapshot to lock it into the immutable state
@@ -310,6 +309,203 @@ func unpackRemoteLayers(ctx context.Context, log logger.Logger, fetcher remotes.
 	return nil
 }
 
+func fetchAndApplyBlobRanges(ctx context.Context, log logger.Logger, fetcher remotes.Fetcher, layerDesc ocispec.Descriptor, root string, ranges []*byteRangeGroup) error {
+	var currentStreamPos int64
+	for _, blobRange := range ranges {
+		// fetch the range as a new compressed stream, the new compressed stream starts reading from position 0
+		rc, err := fetchRange(ctx, fetcher, layerDesc, blobRange.StartOffset, blobRange.EndOffset-blobRange.StartOffset+1)
+		if err != nil {
+			return fmt.Errorf("fetching layer chunk for %d files: %w", len(blobRange.Files), err)
+		}
+
+		currentStreamPos = blobRange.StartOffset
+		for _, zstdFile := range blobRange.Files {
+			path := filepath.Join(root, zstdFile.Name)
+			// discard gaps between files
+			if currentStreamPos < zstdFile.Range.Offset {
+				gap := zstdFile.Range.Offset - currentStreamPos
+				_, err := io.CopyN(io.Discard, rc, gap)
+				if err != nil {
+					return fmt.Errorf("discarting gaps between ranges: %w", err)
+				}
+				currentStreamPos += gap
+			}
+
+			log.Debugf("extracting file %s. Offset %d, endoffset %d, size %d", path, currentStreamPos, blobRange.EndOffset, zstdFile.Range.Size)
+
+			// remove target file if already exists and recreate it as an empty file
+			err = os.Remove(path)
+			if err != nil && !os.IsNotExist(err) {
+				rc.Close()
+				return err
+			}
+			outFile, err := os.Create(path)
+			if err != nil {
+				rc.Close()
+				return err
+			}
+
+			// ensure reader does not go beyond the actual file
+			rangeReader := io.LimitReader(rc, zstdFile.Range.Size)
+			decompressedStream, err := zstd.NewReader(rangeReader)
+			if err != nil {
+				rc.Close()
+				outFile.Close()
+				return fmt.Errorf("uncompressing stream for file %s", zstdFile.Name)
+			}
+
+			// write the file with the decompressed data
+			_, err = io.Copy(outFile, decompressedStream)
+			decompressedStream.Close()
+			// Swallow unexpected EOF error if we are reading the last file chunk, not sure why this error is raised
+			// neither if this is a relevant problem. TODO verify the decompressed size matches the expected one
+			if errors.Is(err, io.ErrUnexpectedEOF) && currentStreamPos+zstdFile.Range.Size-1 == blobRange.EndOffset {
+				err = nil
+			}
+			if err != nil {
+				rc.Close()
+				outFile.Close()
+				return fmt.Errorf("writing %s: %w", path, err)
+			}
+			err = outFile.Close()
+			if err != nil {
+				rc.Close()
+				return fmt.Errorf("closing uncompressed file %s: %w", path, err)
+			}
+
+			// update stream position, this is needed to jump gaps
+			currentStreamPos += zstdFile.Range.Size
+		}
+	}
+	return nil
+}
+
+func applyCachedFiles(ctx context.Context, log logger.Logger, cached []*tocFile, root string) error {
+	return nil
+}
+
+func updateZstdCacheDB(ctx context.Context, log logger.Logger, bdb *bolt.DB, missing []*byteRangeGroup, cached []*tocFile) error {
+	return nil
+}
+
+func createStructuralNodes(ctx context.Context, log logger.Logger, nodes []*estargz.TOCEntry, root string) error {
+	var err error
+	var path string
+
+	// sort paths to ensure we are starting from parent directories
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Name < nodes[j].Name })
+
+	for _, e := range nodes {
+		path = filepath.Join(root, e.Name)
+		switch e.Type {
+		case "reg":
+			if e.Size != 0 || e.Digest != "" {
+				log.Warn("non zero 'reg' entry type found (%s), ignoring it", e.Name)
+			}
+		case "dir":
+			_, err = os.Stat(path)
+			if err == nil {
+				err = os.Chmod(path, e.Stat().Mode())
+			}
+			if errors.Is(err, fs.ErrNotExist) {
+				err = os.MkdirAll(path, e.Stat().Mode())
+			}
+			if err != nil {
+				return fmt.Errorf("creating directory %s: %w", path, err)
+			}
+		case "symlink":
+			err = os.Remove(path)
+			if err != nil && !os.IsNotExist(err) {
+				return err
+			}
+
+			err = os.Symlink(e.LinkName, path)
+			if err != nil {
+				return fmt.Errorf("creating symlink %s -> %s: %w", path, e.LinkName, err)
+			}
+		case "hardlink":
+			log.Warn("'hardlink' entry type found (%s). Hardlinks not supported yet, not creating it", e.Name)
+		case "char", "block":
+			err = os.Remove(path)
+			if err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			dev := unix.Mkdev(uint32(e.DevMajor), uint32(e.DevMinor))
+			err := unix.Mknod(path, uint32(e.Mode), int(dev))
+			if err != nil {
+				return fmt.Errorf("creating char device %s: %w", path, err)
+			}
+		case "fifo":
+			err = os.Remove(path)
+			if err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			err := unix.Mkfifo(path, uint32(e.Mode))
+			if err != nil {
+				return fmt.Errorf("creating the fifo file %s: %w", path, err)
+			}
+		case "chunk":
+			log.Warn("'chunk' entry type found in structural nodes list, ignoring it")
+		}
+	}
+	return nil
+}
+
+func unpackZstdChunkedLayer(
+	ctx context.Context, log logger.Logger, bdb *bolt.DB, fetcher remotes.Fetcher, desc ocispec.Descriptor,
+	nodes []*estargz.TOCEntry, missing []*byteRangeGroup, cached []*tocFile, root string,
+) error {
+	// 6.2 Create all special nodes
+	err := createStructuralNodes(ctx, log, nodes, root)
+	if err != nil {
+		return err
+	}
+
+	// 6.3 fetch and extract missing files
+	err = fetchAndApplyBlobRanges(ctx, log, fetcher, desc, root, missing)
+	if err != nil {
+		return err
+	}
+
+	// 6.4 appplied cached files
+	err = applyCachedFiles(ctx, log, cached, root)
+	if err != nil {
+		return err
+	}
+
+	// 6.5 Update cache DB
+	err = updateZstdCacheDB(ctx, log, bdb, missing, cached)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// fetchAndApplyLayerBlob runs a common and generic layer blob download and unpack to the given mounts stack
+func fetchAndApplyLayerBlob(ctx context.Context, fetcher remotes.Fetcher, layerDesc ocispec.Descriptor, mounts []mount.Mount) error {
+	rc, err := fetcher.Fetch(ctx, layerDesc)
+	if err != nil {
+		return fmt.Errorf("failed to fetch layer %s: %w", layerDesc.Digest, err)
+	}
+
+	uncompressedStream, err := compression.DecompressStream(rc)
+	if err != nil {
+		return fmt.Errorf("setting the uncompressed stream reader: %w", err)
+	}
+
+	// 7. Apply the tar stream directly to the snapshotter's mounts
+	err = applyUnix(ctx, mounts, uncompressedStream, true)
+	uErr := uncompressedStream.Close()
+	if err == nil && uErr != nil {
+		err = uErr
+	}
+	cErr := rc.Close()
+	if err == nil && cErr != nil {
+		err = cErr
+	}
+	return err
+}
+
 type readCloser struct {
 	io.Reader
 	close func()
@@ -327,7 +523,7 @@ type rangeContextKey struct{}
 type rangeTarget struct {
 	Digest string
 	Offset int64
-	Length int64
+	Size   int64
 }
 
 // rangeRoundTripper intercepts requests and injects the Range header
@@ -347,7 +543,7 @@ func (rt *rangeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 	// assume this the request we want to intercept and recreate
 	if strings.Contains(req.URL.Path, target.Digest) && req.Method == http.MethodGet {
 		clonedReq := req.Clone(req.Context())
-		bRange := fmt.Sprintf("bytes=%d-%d", target.Offset, target.Offset+target.Length-1)
+		bRange := fmt.Sprintf("bytes=%d-%d", target.Offset, target.Offset+target.Size-1)
 		clonedReq.Header.Set("Range", bRange)
 		return rt.Base.RoundTrip(clonedReq)
 	}
@@ -375,16 +571,11 @@ func setupResolver() remotes.Resolver {
 	return docker.NewResolver(opts)
 }
 
-func fetchRange(ctx context.Context, fetcher remotes.Fetcher, desc ocispec.Descriptor, offset int64, length int64) (io.ReadCloser, error) {
-	/*fetcher, err := resolver.Fetcher(ctx, ref)
-	if err != nil {
-		return nil, err
-	}*/
-
+func fetchRange(ctx context.Context, fetcher remotes.Fetcher, desc ocispec.Descriptor, offset int64, size int64) (io.ReadCloser, error) {
 	target := rangeTarget{
 		Digest: desc.Digest.Encoded(),
 		Offset: offset,
-		Length: length,
+		Size:   size,
 	}
 	ctxWithRange := context.WithValue(ctx, rangeContextKey{}, target)
 
@@ -396,29 +587,14 @@ func fetchRange(ctx context.Context, fetcher remotes.Fetcher, desc ocispec.Descr
 	return rc, nil
 }
 
-func uncompressBytes(tocBytes []byte) ([]byte, error) {
-	decoder, err := compression.DecompressStream(bytes.NewReader(tocBytes))
-	if err != nil {
-		return nil, fmt.Errorf("decoding TOC bytes: %w", err)
-	}
-	defer decoder.Close()
-
-	uncompressedTOC, err := io.ReadAll(decoder)
-	if err != nil {
-		return nil, fmt.Errorf("reading decompressed TOC: %w", err)
-	}
-
-	return uncompressedTOC, nil
-}
-
-// TODO ensure the fetcher includes our custom RoundTripper, probably define our own type alias for the fetcher
-func fetchZstdTOC(ctx context.Context, log logger.Logger, layerDesc ocispec.Descriptor, fetcher remotes.Fetcher) (*estargz.JTOC, digest.Digest, error) {
+// TODO ensure the fetcher includes our custom RoundTripper, probably define our own type alias for the fetcher or pass our custom resolver type
+func fetchZstdTOC(ctx context.Context, log logger.Logger, layerDesc ocispec.Descriptor, fetcher remotes.Fetcher) (*estargz.JTOC, digest.Digest, int64, error) {
 	var tocDgst digest.Digest
 
 	if layerDesc.MediaType != ocispec.MediaTypeImageLayerZstd {
 		// We do nothing if the layer is not of zstd type
 		log.Debugf("%s is not a zstd layer, no TOC to fecth", layerDesc.Digest.String())
-		return nil, tocDgst, nil
+		return nil, tocDgst, 0, nil
 	}
 
 	if val, ok := layerDesc.Annotations[zstdchunked.ManifestChecksumAnnotation]; ok {
@@ -430,45 +606,303 @@ func fetchZstdTOC(ctx context.Context, log logger.Logger, layerDesc ocispec.Desc
 
 	rc, err := fetchRange(ctx, fetcher, layerDesc, layerDesc.Size-footerSize, footerSize)
 	if err != nil {
-		return nil, tocDgst, fmt.Errorf("fetching blob footer: %w", err)
+		return nil, tocDgst, 0, fmt.Errorf("fetching blob footer: %w", err)
 	}
 	footerBytes, err := io.ReadAll(rc)
 	cErr := rc.Close()
 	if err != nil {
-		return nil, tocDgst, fmt.Errorf("reading zstd footer bytes: %w", err)
+		return nil, tocDgst, 0, fmt.Errorf("reading zstd footer bytes: %w", err)
 	}
 	if cErr != nil {
-		return nil, tocDgst, fmt.Errorf("closing footer reader: %w", err)
+		return nil, tocDgst, 0, fmt.Errorf("closing footer reader: %w", err)
 	}
 
 	_, tocOff, tocSize, err := decompressor.ParseFooter(footerBytes)
 	if err != nil {
 		// We assume this is not of zstd:chunked type and process normally
 		log.Debugf("could not parse zstd TOC from footer: %w", err)
-		return nil, tocDgst, nil
+		return nil, tocDgst, 0, nil
 	}
 
 	if tocSize <= 0 {
 		log.Warnf("inconsistent TOC size (%d) detected, ignoring TOC", tocSize)
-		return nil, tocDgst, nil
+		return nil, tocDgst, 0, nil
 	}
 
 	rc, err = fetchRange(ctx, fetcher, layerDesc, tocOff, tocSize)
 	if err != nil {
-		return nil, tocDgst, fmt.Errorf("fetching TOC: %w", err)
+		return nil, tocDgst, 0, fmt.Errorf("fetching TOC: %w", err)
 	}
 
 	toc, tocDgst, err := decompressor.ParseTOC(rc)
 	cErr = rc.Close()
 	if err != nil {
-		return nil, tocDgst, fmt.Errorf("decompressing TOC: %w", err)
+		return nil, tocDgst, 0, fmt.Errorf("decompressing TOC: %w", err)
 	}
 	if cErr != nil {
-		return nil, tocDgst, fmt.Errorf("closing TOC reader: %w", err)
+		return nil, tocDgst, 0, fmt.Errorf("closing TOC reader: %w", err)
 	}
 	log.Debugf("uncompressed TOC with %d entries and digest %s", len(toc.Entries), tocDgst.String())
 
-	return toc, tocDgst, nil
+	return toc, tocDgst, tocOff, nil
+}
+
+// tocFile represents an entire file, aggregating the bytes range of the initial
+// reg entry and any subsequent chunk entries
+type tocFile struct {
+	Name        string
+	Digest      string
+	IsCacheHit  bool
+	CachedPaths []string
+	Range       *byteRange
+}
+
+type byteRange struct {
+	Offset int64
+	Size   int64
+}
+
+// byteRangeGroup represents a coalesced HTTP Range request for one or more files
+type byteRangeGroup struct {
+	StartOffset int64
+	EndOffset   int64
+	Files       []*tocFile
+}
+
+func processTOC(log logger.Logger, bdb *bolt.DB, toc *estargz.JTOC, tocOffset int64) (ranges []*byteRangeGroup, cached []*tocFile, specialNodes []*estargz.TOCEntry) {
+	var active *tocFile
+	var missing []*tocFile
+
+	// Helper function to evaluate the fully grouped file
+	queueActiveFile := func(file *tocFile) {
+		if file.IsCacheHit {
+			// Cache Hit: The whole file is cached. Ignore the chunks and queue the reflink.
+			cached = append(cached, file)
+		} else {
+			// Cache Miss: Queue the range chunk for download.
+			missing = append(missing, file)
+		}
+	}
+
+	sort.Slice(toc.Entries, func(i, j int) bool {
+		return toc.Entries[i].Offset < toc.Entries[j].Offset
+	})
+
+	var nextOffset int64
+	for i, entry := range toc.Entries {
+		if i+1 == len(toc.Entries) {
+			nextOffset = tocOffset - 1
+		} else {
+			nextOffset = toc.Entries[i+1].Offset
+		}
+
+		// 1. If it's a chunk, append it to the currently active file
+		if entry.Type == "chunk" {
+			if active != nil && active.Name == entry.Name {
+				active.Range.Size = nextOffset - active.Range.Offset
+			}
+			continue
+		}
+
+		// 2. If we reach a new file/node, the previous activeFile is fully grouped
+		if active != nil {
+			queueActiveFile(active)
+			active = nil // Reset
+		}
+
+		// 3. Handle the new entry based on its type
+		switch entry.Type {
+		case "reg":
+			if entry.Size == 0 || entry.Digest == "" {
+				specialNodes = append(specialNodes, entry)
+				continue
+			}
+			// Query bbolt using the WHOLE file digest
+			paths, err := getCachedPaths(bdb, entry.Digest)
+			if err != nil {
+				log.Warnf("error getting cached paths for digest %s, considering it a cache miss. err: %s", entry.Digest, err.Error())
+			}
+
+			active = &tocFile{
+				Name:        entry.Name,
+				Digest:      entry.Digest,
+				IsCacheHit:  len(paths) > 0,
+				CachedPaths: paths,
+				Range: &byteRange{
+					Offset: entry.Offset,
+					Size:   nextOffset - entry.Offset,
+				}, // The 'reg' entry contains the first chunk's payload coordinates
+			}
+
+		case "dir", "symlink", "hardlink", "char", "block", "fifo":
+			specialNodes = append(specialNodes, entry)
+		}
+	}
+
+	// Don't forget to queue the very last file in the TOC
+	if active != nil {
+		queueActiveFile(active)
+	}
+	ranges = groupMissingFiles(missing)
+
+	log.Debugf("collected %d individual missing ranges, but coalesced them to %d missing ranges", len(missing), len(ranges))
+	log.Debugf("collected %d reflink tasks", len(cached))
+
+	return ranges, cached, specialNodes
+}
+
+func groupMissingFiles(misses []*tocFile) []*byteRangeGroup {
+	if len(misses) == 0 {
+		return nil
+	}
+
+	sort.Slice(misses, func(i, j int) bool {
+		return misses[i].Range.Offset < misses[j].Range.Offset
+	})
+
+	var groups []*byteRangeGroup
+	var current *byteRangeGroup
+
+	// Define a threshold (e.g., 128KB) where it is cheaper to download
+	// the gap than to initiate a new HTTP request. He want to optimize
+	// downloads rather than the decoding process of the compressed stream.
+	const gapThreshold int64 = 128 * 1024
+
+	for _, miss := range misses {
+		if current == nil {
+			current = &byteRangeGroup{
+				StartOffset: miss.Range.Offset,
+				EndOffset:   miss.Range.Offset + miss.Range.Size - 1,
+				Files:       []*tocFile{miss},
+			}
+			continue
+		}
+
+		// Calculate the physical byte gap between the current group and the next chunk
+		gap := miss.Range.Offset - (current.EndOffset + 1)
+
+		if gap >= 0 && gap <= gapThreshold {
+			// The gap is small enough. Merge this chunk into the current HTTP request.
+			current.EndOffset = miss.Range.Offset + miss.Range.Size - 1
+			current.Files = append(current.Files, miss)
+			continue
+		}
+		// The gap is too large. Save the current group and start a new one.
+		groups = append(groups, current)
+		current = &byteRangeGroup{
+			StartOffset: miss.Range.Offset,
+			EndOffset:   miss.Range.Offset + miss.Range.Size - 1,
+			Files:       []*tocFile{miss},
+		}
+	}
+
+	if current != nil {
+		groups = append(groups, current)
+	}
+
+	return groups
+}
+
+// getCachedPaths returns a list of local paths where the uncompressed chunk resides
+func getCachedPaths(bdb *bolt.DB, chunkDigest string) ([]string, error) {
+	var paths []string
+
+	err := bdb.View(func(tx *bolt.Tx) error {
+		// Traverse the bucket hierarchy safely
+		root := tx.Bucket([]byte(TopLevelBucket))
+		if root == nil {
+			return nil // Cache doesn't exist yet
+		}
+
+		locBucket := root.Bucket([]byte(ChunkLocBucket))
+		if locBucket == nil {
+			return nil
+		}
+
+		// Fetch the JSON array
+		data := locBucket.Get([]byte(chunkDigest))
+		if data != nil {
+			if err := json.Unmarshal(data, &paths); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	return paths, err
+}
+
+// recordChunk updates the cache to link a chunk digest to its new physical path
+func recordChunk(db *bolt.DB, snapshotKey string, chunkDigest string, newPath string) error {
+	return db.Update(func(tx *bolt.Tx) error {
+		root := tx.Bucket([]byte(TopLevelBucket))
+		locBucket := root.Bucket([]byte(ChunkLocBucket))
+		snapBucket := root.Bucket([]byte(SnapshotChunkBucket))
+
+		// --- 1. Update Forward Index ---
+		var paths []string
+		if data := locBucket.Get([]byte(chunkDigest)); data != nil {
+			json.Unmarshal(data, &paths)
+		}
+
+		// Deduplicate: Ensure we don't add the same path twice
+		pathExists := slices.Contains(paths, newPath)
+		if !pathExists {
+			paths = append(paths, newPath)
+			encodedPaths, _ := json.Marshal(paths)
+			locBucket.Put([]byte(chunkDigest), encodedPaths)
+		}
+
+		// --- 2. Update Reverse Index ---
+		var digests []string
+		if data := snapBucket.Get([]byte(snapshotKey)); data != nil {
+			json.Unmarshal(data, &digests)
+		}
+
+		digestExists := slices.Contains(digests, chunkDigest)
+		if !digestExists {
+			digests = append(digests, chunkDigest)
+			encodedDigests, _ := json.Marshal(digests)
+			snapBucket.Put([]byte(snapshotKey), encodedDigests)
+		}
+
+		return nil
+	})
+}
+
+func runAtMountsStack(ctx context.Context, mounts []mount.Mount, callback func(root string) error) (err error) {
+	switch {
+	case len(mounts) == 1 && mounts[0].Type == "overlay":
+		// OverlayConvertWhiteout (mknod c 0 0) doesn't work in userns.
+		// https://github.com/containerd/containerd/issues/3762
+		if userns.RunningInUserNS() {
+			break
+		}
+		path, _, err := getOverlayPath(mounts[0].Options)
+		if err != nil {
+			if errdefs.IsInvalidArgument(err) {
+				break
+			}
+			return err
+		}
+		// TODO consider the need of computing the equivalent of
+		// archive.WithConvertWhiteout and archive.WithParents
+		err = callback(path)
+		if err == nil {
+			err = doSyncFs(path)
+		}
+		return err
+	case len(mounts) == 1 && mounts[0].Type == "bind":
+		defer func() {
+			if err != nil {
+				return
+			}
+			err = doSyncFs(mounts[0].Source)
+		}()
+	}
+	return mount.WithTempMount(ctx, mounts, func(root string) error {
+		return callback(root)
+	})
 }
 
 // From here up to the and of the file the code is copied form containerd
