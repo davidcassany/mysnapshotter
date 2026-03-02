@@ -309,7 +309,7 @@ func unpackRemoteLayers(ctx context.Context, log logger.Logger, fetcher remotes.
 	return nil
 }
 
-func fetchAndApplyBlobRanges(ctx context.Context, log logger.Logger, fetcher remotes.Fetcher, layerDesc ocispec.Descriptor, root string, ranges []*byteRangeGroup) error {
+func fetchAndApplyBlobRanges(ctx context.Context, log logger.Logger, fetcher remotes.Fetcher, layerDesc ocispec.Descriptor, root string, ranges []*byteRangeGroup) (err error) {
 	var currentStreamPos int64
 	for _, blobRange := range ranges {
 		// fetch the range as a new compressed stream, the new compressed stream starts reading from position 0
@@ -317,10 +317,16 @@ func fetchAndApplyBlobRanges(ctx context.Context, log logger.Logger, fetcher rem
 		if err != nil {
 			return fmt.Errorf("fetching layer chunk for %d files: %w", len(blobRange.Files), err)
 		}
+		defer func() {
+			cErr := rc.Close()
+			if err == nil && cErr != nil {
+				err = fmt.Errorf("closing stream from range fetcher: %w", cErr)
+			}
+		}()
 
 		currentStreamPos = blobRange.StartOffset
 		for _, zstdFile := range blobRange.Files {
-			path := filepath.Join(root, zstdFile.Name)
+
 			// discard gaps between files
 			if currentStreamPos < zstdFile.Range.Offset {
 				gap := zstdFile.Range.Offset - currentStreamPos
@@ -331,52 +337,71 @@ func fetchAndApplyBlobRanges(ctx context.Context, log logger.Logger, fetcher rem
 				currentStreamPos += gap
 			}
 
-			log.Debugf("extracting file %s. Offset %d, endoffset %d, size %d", path, currentStreamPos, blobRange.EndOffset, zstdFile.Range.Size)
-
-			// remove target file if already exists and recreate it as an empty file
-			err = os.Remove(path)
-			if err != nil && !os.IsNotExist(err) {
-				rc.Close()
-				return err
-			}
-			outFile, err := os.Create(path)
+			err = decompressFile(log, rc, zstdFile, root)
 			if err != nil {
-				rc.Close()
-				return err
-			}
-
-			// ensure reader does not go beyond the actual file
-			rangeReader := io.LimitReader(rc, zstdFile.Range.Size)
-			decompressedStream, err := zstd.NewReader(rangeReader)
-			if err != nil {
-				rc.Close()
-				outFile.Close()
-				return fmt.Errorf("uncompressing stream for file %s", zstdFile.Name)
-			}
-
-			// write the file with the decompressed data
-			_, err = io.Copy(outFile, decompressedStream)
-			decompressedStream.Close()
-			// Swallow unexpected EOF error if we are reading the last file chunk, not sure why this error is raised
-			// neither if this is a relevant problem. TODO verify the decompressed size matches the expected one
-			if errors.Is(err, io.ErrUnexpectedEOF) && currentStreamPos+zstdFile.Range.Size-1 == blobRange.EndOffset {
-				err = nil
-			}
-			if err != nil {
-				rc.Close()
-				outFile.Close()
-				return fmt.Errorf("writing %s: %w", path, err)
-			}
-			err = outFile.Close()
-			if err != nil {
-				rc.Close()
-				return fmt.Errorf("closing uncompressed file %s: %w", path, err)
+				return fmt.Errorf("decompressing file (%s) from zstd:chunked file range: %w", zstdFile.entry.Name, err)
 			}
 
 			// update stream position, this is needed to jump gaps
 			currentStreamPos += zstdFile.Range.Size
 		}
 	}
+	return nil
+}
+
+// TODO limit rc to read only (no close) and limit outFile to io.Writer
+func decompressFile(log logger.Logger, rc io.ReadCloser, zstdFile *tocFile, root string) (err error) {
+	// remove target file if already exists and recreate it as an empty file
+	path := filepath.Join(root, zstdFile.entry.Name)
+	err = os.Remove(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	outFile, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(zstdFile.entry.Mode))
+	if err != nil {
+		return err
+	}
+	defer func() {
+		cErr := outFile.Close()
+		if err == nil && cErr != nil {
+			err = fmt.Errorf("closing output file %s: %w", path, cErr)
+		}
+		if err == nil {
+			err = applyMetadata(path, zstdFile.entry)
+			if err != nil {
+				err = fmt.Errorf("applying metadata to file %s: %w", path, err)
+			}
+		}
+	}()
+
+	// limit the range to avoid reading next file
+	rangeReader := io.LimitReader(rc, zstdFile.Range.Size)
+	decompressedStream, err := zstd.NewReader(rangeReader)
+	if err != nil {
+		return fmt.Errorf("uncompressing stream for file %s", zstdFile.entry.Name)
+	}
+	defer decompressedStream.Close()
+
+	// limit the copy to skip tar headers
+	written, err := io.CopyN(outFile, decompressedStream, zstdFile.entry.Size)
+	if written != zstdFile.entry.Size {
+		log.Warnf("written bytes (%d) not matching expected size (%d)", written, zstdFile.entry.Size)
+	}
+	if err != nil {
+		return fmt.Errorf("writing bytes for file %s: %w", zstdFile.entry.Name, err)
+	}
+	// discard tar headers
+	_, err = io.Copy(io.Discard, decompressedStream)
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		// TODO: I don't know why I always get a io.ErrUnexpectedEOF for the last file
+		log.Debugf("Unexpected EOF when discarting bytes from uncompressed stream: %s", err.Error())
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("discarting bytes from uncompressed stream: %w", err)
+	}
+	// TODO set xattr to the file
 	return nil
 }
 
@@ -388,8 +413,7 @@ func updateZstdCacheDB(ctx context.Context, log logger.Logger, bdb *bolt.DB, mis
 	return nil
 }
 
-func createStructuralNodes(ctx context.Context, log logger.Logger, nodes []*estargz.TOCEntry, root string) error {
-	var err error
+func createStructuralNodes(ctx context.Context, log logger.Logger, nodes []*estargz.TOCEntry, root string) (pending []*estargz.TOCEntry, err error) {
 	var path string
 
 	// sort paths to ensure we are starting from parent directories
@@ -397,55 +421,153 @@ func createStructuralNodes(ctx context.Context, log logger.Logger, nodes []*esta
 
 	for _, e := range nodes {
 		path = filepath.Join(root, e.Name)
+		goMode := os.FileMode(e.Mode)
+		permBits := uint32(goMode & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky))
 		switch e.Type {
 		case "reg":
 			if e.Size != 0 || e.Digest != "" {
 				log.Warn("non zero 'reg' entry type found (%s), ignoring it", e.Name)
+				continue
+			}
+			flags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+			file, err := os.OpenFile(path, flags, goMode.Perm())
+			if err != nil {
+				return nil, fmt.Errorf("creating file %s: %w", path, err)
+			}
+			err = file.Close()
+			if err != nil {
+				return nil, fmt.Errorf("closing file %s: %w", path, err)
 			}
 		case "dir":
 			_, err = os.Stat(path)
 			if err == nil {
-				err = os.Chmod(path, e.Stat().Mode())
+				err = os.Chmod(path, os.FileMode(0700))
 			}
 			if errors.Is(err, fs.ErrNotExist) {
-				err = os.MkdirAll(path, e.Stat().Mode())
+				err = os.MkdirAll(path, os.FileMode(0700))
 			}
 			if err != nil {
-				return fmt.Errorf("creating directory %s: %w", path, err)
+				return nil, fmt.Errorf("creating directory %s: %w", path, err)
 			}
+			// apply metadata and permissions to directories as the last step
+			pending = append(pending, e)
+			continue
 		case "symlink":
+			//TODO sanitize links, links going out of the tree shouldn't be allowed!
 			err = os.Remove(path)
 			if err != nil && !os.IsNotExist(err) {
-				return err
+				return nil, err
 			}
 
 			err = os.Symlink(e.LinkName, path)
 			if err != nil {
-				return fmt.Errorf("creating symlink %s -> %s: %w", path, e.LinkName, err)
+				return nil, fmt.Errorf("creating symlink %s -> %s: %w", path, e.LinkName, err)
 			}
 		case "hardlink":
-			log.Warn("'hardlink' entry type found (%s). Hardlinks not supported yet, not creating it", e.Name)
+			// apply hardlinks after applying cached and fetched files
+			pending = append(pending, e)
+			continue
 		case "char", "block":
 			err = os.Remove(path)
 			if err != nil && !os.IsNotExist(err) {
-				return err
+				return nil, err
+			}
+			mode := permBits | unix.S_IFCHR
+			if e.Type == "block" {
+				mode = permBits | unix.S_IFBLK
 			}
 			dev := unix.Mkdev(uint32(e.DevMajor), uint32(e.DevMinor))
-			err := unix.Mknod(path, uint32(e.Mode), int(dev))
+			err := unix.Mknod(path, mode, int(dev))
 			if err != nil {
-				return fmt.Errorf("creating char device %s: %w", path, err)
+				return nil, fmt.Errorf("creating char device %s: %w", path, err)
 			}
 		case "fifo":
 			err = os.Remove(path)
 			if err != nil && !os.IsNotExist(err) {
-				return err
+				return nil, err
 			}
-			err := unix.Mkfifo(path, uint32(e.Mode))
+			err := unix.Mkfifo(path, permBits|unix.S_IFIFO)
 			if err != nil {
-				return fmt.Errorf("creating the fifo file %s: %w", path, err)
+				return nil, fmt.Errorf("creating the fifo file %s: %w", path, err)
 			}
 		case "chunk":
 			log.Warn("'chunk' entry type found in structural nodes list, ignoring it")
+			continue
+		}
+		err = applyMetadata(path, e)
+		if err != nil {
+			return nil, fmt.Errorf("failed applying GID, UID or Xattrs to %s: %w", path, err)
+		}
+	}
+	return pending, nil
+}
+
+// applyMetadata sets the UID, GID, MTime and Extended Attributes on a created node
+func applyMetadata(targetPath string, entry *estargz.TOCEntry) error {
+	// If targetPath is a symlink, Lchown changes the symlink itself.
+	if err := os.Lchown(targetPath, entry.UID, entry.GID); err != nil {
+		return fmt.Errorf("failed to apply Lchown to %s: %w", targetPath, err)
+	}
+
+	if entry.ModTime3339 != "" {
+		modTime, err := time.Parse(time.RFC3339, entry.ModTime3339)
+		if err != nil {
+			return fmt.Errorf("parsing timestamp %s of file %s: %w", entry.ModTime3339, targetPath, err)
+		}
+
+		var ts [2]unix.Timespec
+		// ATime fallback to MTime
+		ts[0] = unix.NsecToTimespec(modTime.UnixNano())
+		// MTime
+		ts[1] = unix.NsecToTimespec(modTime.UnixNano())
+
+		// Do not follow symlinks
+		err = unix.UtimesNanoAt(unix.AT_FDCWD, targetPath, ts[:], unix.AT_SYMLINK_NOFOLLOW)
+		if err != nil {
+			return fmt.Errorf("failed to apply timestamps to %s: %w", targetPath, err)
+		}
+	}
+
+	for name, value := range entry.Xattrs {
+		// The '0' flag means "create or replace".
+		err := unix.Lsetxattr(targetPath, name, value, 0)
+		if err != nil {
+			// Note: Some xattrs requires privileges (e.g. CAP_SYS_ADMIN)
+			return fmt.Errorf("failed to set xattr %s on %s: %w", name, targetPath, err)
+		}
+	}
+	return nil
+}
+
+func applyPendingNodes(ctx context.Context, log logger.Logger, pending []*estargz.TOCEntry, root string) error {
+	var path string
+	var err error
+
+	// in reverse order to ensure we do not fall in the readonly trap
+	slices.Reverse(pending)
+
+	for _, e := range pending {
+		path = filepath.Join(root, e.Name)
+		goMode := os.FileMode(e.Mode)
+		switch e.Type {
+		case "dir":
+			err = os.Chmod(path, goMode.Perm())
+			if err != nil {
+				return fmt.Errorf("setting permissions for directory %s: %w", path, err)
+			}
+		case "hardlink":
+			linkTarget := filepath.Join(root, e.LinkName)
+			err = os.Link(linkTarget, path)
+			if err != nil {
+				return fmt.Errorf("creating hardlink %s -> %s: %w", path, linkTarget, err)
+			}
+		default:
+			log.Warnf("found file of type %s (%s) in pending list, ignoring it", e.Type, path)
+			continue
+		}
+		err = applyMetadata(path, e)
+		if err != nil {
+			return fmt.Errorf("setting metadata for %s: %w", path, err)
 		}
 	}
 	return nil
@@ -456,7 +578,7 @@ func unpackZstdChunkedLayer(
 	nodes []*estargz.TOCEntry, missing []*byteRangeGroup, cached []*tocFile, root string,
 ) error {
 	// 6.2 Create all special nodes
-	err := createStructuralNodes(ctx, log, nodes, root)
+	pending, err := createStructuralNodes(ctx, log, nodes, root)
 	if err != nil {
 		return err
 	}
@@ -473,7 +595,13 @@ func unpackZstdChunkedLayer(
 		return err
 	}
 
-	// 6.5 Update cache DB
+	// 6.5 handle hardlinks and directories metadata in reverse order
+	err = applyPendingNodes(ctx, log, pending, root)
+	if err != nil {
+		return err
+	}
+
+	// 6.6 Update cache DB
 	err = updateZstdCacheDB(ctx, log, bdb, missing, cached)
 	if err != nil {
 		return err
@@ -650,8 +778,7 @@ func fetchZstdTOC(ctx context.Context, log logger.Logger, layerDesc ocispec.Desc
 // tocFile represents an entire file, aggregating the bytes range of the initial
 // reg entry and any subsequent chunk entries
 type tocFile struct {
-	Name        string
-	Digest      string
+	entry       *estargz.TOCEntry
 	IsCacheHit  bool
 	CachedPaths []string
 	Range       *byteRange
@@ -691,14 +818,14 @@ func processTOC(log logger.Logger, bdb *bolt.DB, toc *estargz.JTOC, tocOffset in
 	var nextOffset int64
 	for i, entry := range toc.Entries {
 		if i+1 == len(toc.Entries) {
-			nextOffset = tocOffset - 1
+			nextOffset = tocOffset
 		} else {
 			nextOffset = toc.Entries[i+1].Offset
 		}
 
 		// 1. If it's a chunk, append it to the currently active file
 		if entry.Type == "chunk" {
-			if active != nil && active.Name == entry.Name {
+			if active != nil && active.entry.Name == entry.Name {
 				active.Range.Size = nextOffset - active.Range.Offset
 			}
 			continue
@@ -724,8 +851,7 @@ func processTOC(log logger.Logger, bdb *bolt.DB, toc *estargz.JTOC, tocOffset in
 			}
 
 			active = &tocFile{
-				Name:        entry.Name,
-				Digest:      entry.Digest,
+				entry:       entry,
 				IsCacheHit:  len(paths) > 0,
 				CachedPaths: paths,
 				Range: &byteRange{
