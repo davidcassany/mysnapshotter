@@ -25,7 +25,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var cs ocistore.OCIStore
+var cs *ocistore.OCIStore
+var log logger.Logger
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
@@ -45,12 +46,7 @@ func Execute() {
 	}
 }
 
-func initCS(cmd *cobra.Command, args []string) error {
-	flags := cmd.Flags()
-	root, _ := flags.GetString("root")
-	llvl, _ := flags.GetString("loglevel")
-	debug, _ := flags.GetBool("debug")
-
+func initLogger(debug bool, llvl string) logger.Logger {
 	var log logger.Logger
 	var err error
 
@@ -65,6 +61,16 @@ func initCS(cmd *cobra.Command, args []string) error {
 	} else {
 		log, _ = logger.NewLogger(logger.InfoLevel)
 	}
+	return log
+}
+
+func initCS(cmd *cobra.Command, args []string) error {
+	flags := cmd.Flags()
+	root, _ := flags.GetString("root")
+	llvl, _ := flags.GetString("loglevel")
+	debug, _ := flags.GetBool("debug")
+
+	log = initLogger(debug, llvl)
 
 	cs = ocistore.NewOCIStore(log, root)
 	return cs.Init(context.Background())
@@ -78,14 +84,19 @@ func init() {
 
 	cobra.OnFinalize(
 		func() {
-			if cs.IsInitiated() {
-				err := cs.GetClient().SnapshotService(cs.GetDriver()).Close()
+			if cs != nil && cs.IsInitiated() {
+				err := cs.GetSnapshotter(cs.GetDriver()).Close()
 				if err != nil {
-					cs.Logger().Debugf("failed closing snapshotter: %v", err)
+					cs.Logger().Warnf("failed closing snapshotter: %v", err)
 				}
 			}
 		}, func() {
-			//TODO handle garbage collector
+			if cs != nil && cs.IsInitiated() {
+				err := cs.RunGarbageCollector()
+				if err != nil {
+					cs.Logger().Warnf("failed running garbage collector: %v", err)
+				}
+			}
 		},
 	)
 }

@@ -28,13 +28,9 @@ var unpackCmd = &cobra.Command{
 	PreRunE: initCS,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		log := cs.Logger()
-		img, err := cs.Get(args[0])
-		if err != nil {
-			return err
-		}
 
-		log.Infof("Image name '%s' with digest '%s' found, unpacking", img.Name(), img.Metadata().Target.Digest)
-		err = cs.Unpack(img)
+		log.Infof("Attempting to unpack %q", args[0])
+		err := cs.Unpack(args[0])
 		if err != nil {
 			return err
 		}

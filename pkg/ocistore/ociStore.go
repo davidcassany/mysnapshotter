@@ -29,6 +29,7 @@ import (
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/metadata"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
@@ -47,7 +48,7 @@ const (
 	contentDir    = "content"
 	namespace     = "elemental-system"
 
-	DefaultRoot         = "/tmp/contentstore"
+	DefaultRoot         = "/tmp/ocistore"
 	LabelSnapshotImgRef = "containerd.io/snapshot/image.ref"
 
 	missInitErrMsg = "uninitiated containerdstore instance"
@@ -62,13 +63,18 @@ type OCIStore struct {
 	namespace string
 	platform  platforms.MatchComparer
 
-	ctx context.Context
-	db  *metadata.DB
-	cli *client.Client
+	ctx   context.Context
+	db    *metadata.DB
+	bdb   *bolt.DB
+	lm    leases.Manager
+	is    images.Store
+	cs    content.Store
+	ds    client.DiffService
+	snaps map[string]snapshots.Snapshotter
 }
 
-func NewOCIStore(log logger.Logger, root string) OCIStore {
-	return OCIStore{
+func NewOCIStore(log logger.Logger, root string) *OCIStore {
+	return &OCIStore{
 		root: root, driver: overlayDriver, namespace: namespace,
 		log: log, platform: platforms.DefaultStrict(),
 	}
@@ -112,21 +118,19 @@ func (c *OCIStore) Init(mainCtx context.Context) error {
 		return err
 	}
 
-	// TODO make client opts configurable
-	cli, err := client.NewWithConn(nil, client.WithServices(
-		client.WithContentStore(db.ContentStore()),
-		client.WithImageStore(metadata.NewImageStore(db)),
-		client.WithLeasesService(metadata.NewLeaseManager(db)),
-		client.WithDiffService(NewDiffService(db.ContentStore())),
-		client.WithSnapshotters(snapshotters),
-	), client.WithDefaultPlatform(c.platform))
-	if err != nil {
-		return err
-	}
+	lm := metadata.NewLeaseManager(db)
+	is := metadata.NewImageStore(db)
+	cs := db.ContentStore()
+	ds := NewDiffService(cs)
 
 	c.ctx = ctx
 	c.db = db
-	c.cli = cli
+	c.bdb = bdb
+	c.lm = lm
+	c.is = is
+	c.cs = cs
+	c.ds = ds
+	c.snaps = snapshotters
 	return nil
 }
 
@@ -134,11 +138,50 @@ func (c *OCIStore) IsInitiated() bool {
 	return c.ctx != nil
 }
 
-func (c *OCIStore) GetClient() *client.Client {
-	if !c.IsInitiated() {
-		return nil
+func (c *OCIStore) Ctx() context.Context {
+	return c.ctx
+}
+
+func (c *OCIStore) RunGarbageCollector() error {
+	gcStats, err := c.db.GarbageCollect(c.ctx)
+	if err != nil {
+		return fmt.Errorf("failed to run garbage collection: %w", err)
 	}
-	return c.cli
+
+	c.log.Debugf("Garbage Collection complete. Elapsed time: %v\n", gcStats.Elapsed())
+	return nil
+}
+
+// WithLease attaches a lease on the OCIStore context
+func (c *OCIStore) WithLease(opts ...leases.Opt) (context.Context, func(context.Context) error, error) {
+	nop := func(context.Context) error { return nil }
+
+	_, ok := leases.FromContext(c.ctx)
+	if ok {
+		return c.ctx, nop, nil
+	}
+
+	if len(opts) == 0 {
+		// Use default lease configuration if no options provided
+		opts = []leases.Opt{
+			leases.WithRandomID(),
+			leases.WithExpiration(24 * time.Hour),
+		}
+	}
+
+	l, err := c.lm.Create(c.ctx, opts...)
+	if err != nil {
+		return c.ctx, nop, err
+	}
+
+	ctx := leases.WithLease(c.ctx, l.ID)
+	return ctx, func(ctx context.Context) error {
+		return c.lm.Delete(ctx, l)
+	}, nil
+}
+
+func (c *OCIStore) GetSnapshotter(driver string) snapshots.Snapshotter {
+	return c.snaps[driver]
 }
 
 func (c *OCIStore) GetDriver() string {
@@ -151,14 +194,14 @@ func (c *OCIStore) GetDriver() string {
 // Methods copied from nerdctl imgutils package, adding a dependency to nerdctl could be considered
 
 // ReadImageConfig reads the config spec (`application/vnd.oci.image.config.v1+json`) for img.platform from content store.
-func ReadImageConfig(ctx context.Context, img client.Image) (ocispec.Image, ocispec.Descriptor, error) {
+func (c *OCIStore) ReadImageConfig(ctx context.Context, img images.Image) (ocispec.Image, ocispec.Descriptor, error) {
 	var config ocispec.Image
 
-	configDesc, err := img.Config(ctx) // aware of img.platform
+	configDesc, err := img.Config(ctx, c.cs, c.platform) // aware of img.platform
 	if err != nil {
 		return config, configDesc, err
 	}
-	p, err := content.ReadBlob(ctx, img.ContentStore(), configDesc)
+	p, err := content.ReadBlob(ctx, c.cs, configDesc)
 	if err != nil {
 		return config, configDesc, err
 	}
@@ -169,12 +212,12 @@ func ReadImageConfig(ctx context.Context, img client.Image) (ocispec.Image, ocis
 }
 
 // ReadIndex returns image index, or nil for non-indexed image.
-func ReadIndex(ctx context.Context, img client.Image) (*ocispec.Index, *ocispec.Descriptor, error) {
-	desc := img.Target()
+func (c *OCIStore) ReadIndex(ctx context.Context, img images.Image) (*ocispec.Index, *ocispec.Descriptor, error) {
+	desc := img.Target
 	if !images.IsIndexType(desc.MediaType) {
 		return nil, nil, nil
 	}
-	b, err := content.ReadBlob(ctx, img.ContentStore(), desc)
+	b, err := content.ReadBlob(ctx, c.cs, desc)
 	if err != nil {
 		return nil, &desc, err
 	}
@@ -187,11 +230,10 @@ func ReadIndex(ctx context.Context, img client.Image) (*ocispec.Index, *ocispec.
 }
 
 // ReadManifest returns the manifest for img.platform, or nil if no manifest was found.
-func ReadManifest(ctx context.Context, img client.Image) (*ocispec.Manifest, *ocispec.Descriptor, error) {
-	cs := img.ContentStore()
-	targetDesc := img.Target()
+func (c *OCIStore) ReadManifest(ctx context.Context, img images.Image) (*ocispec.Manifest, *ocispec.Descriptor, error) {
+	targetDesc := img.Target
 	if images.IsManifestType(targetDesc.MediaType) {
-		b, err := content.ReadBlob(ctx, img.ContentStore(), targetDesc)
+		b, err := content.ReadBlob(ctx, c.cs, targetDesc)
 		if err != nil {
 			return nil, &targetDesc, err
 		}
@@ -202,11 +244,11 @@ func ReadManifest(ctx context.Context, img client.Image) (*ocispec.Manifest, *oc
 		return &mani, &targetDesc, nil
 	}
 	if images.IsIndexType(targetDesc.MediaType) {
-		idx, _, err := ReadIndex(ctx, img)
+		idx, _, err := c.ReadIndex(ctx, img)
 		if err != nil {
 			return nil, nil, err
 		}
-		configDesc, err := img.Config(ctx) // aware of img.platform
+		configDesc, err := img.Config(ctx, c.cs, c.platform)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -215,7 +257,7 @@ func ReadManifest(ctx context.Context, img client.Image) (*ocispec.Manifest, *oc
 		for _, maniDesc := range idx.Manifests {
 			maniDesc := maniDesc
 			// ignore non-nil err
-			if b, err := content.ReadBlob(ctx, cs, maniDesc); err == nil {
+			if b, err := content.ReadBlob(ctx, c.cs, maniDesc); err == nil {
 				var mani ocispec.Manifest
 				if err := json.Unmarshal(b, &mani); err != nil {
 					return nil, nil, err

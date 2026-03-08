@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
@@ -63,7 +63,7 @@ func (c *OCIStore) MountFromScratch(target string, key string) (string, error) {
 	return c.Mount(nil, target, key, false)
 }
 
-func (c *OCIStore) Mount(img client.Image, target string, key string, readonly bool, opts ...MountOpt) (snapshotKey string, retErr error) {
+func (c *OCIStore) Mount(img *images.Image, target string, key string, readonly bool, opts ...MountOpt) (snapshotKey string, retErr error) {
 	if !c.IsInitiated() {
 		return "", errors.New(missInitErrMsg)
 	}
@@ -85,9 +85,9 @@ func (c *OCIStore) Mount(img client.Image, target string, key string, readonly b
 	}
 
 	// TODO handle lease properly, whats the purpose of this setup?
-	ctx, done, err := c.cli.WithLease(c.ctx,
+	ctx, done, err := c.WithLease(
 		leases.WithID(key),
-		leases.WithExpiration(24*time.Hour),
+		leases.WithExpiration(1*time.Hour),
 		leases.WithLabel("containerd.io/gc.ref.snapshot."+c.driver, key),
 	)
 	if err != nil && !errdefs.IsAlreadyExists(err) {
@@ -105,10 +105,10 @@ func (c *OCIStore) Mount(img client.Image, target string, key string, readonly b
 	if mOpt.unpack {
 		err = c.unpack(ctx, img, mOpt.aOpts...)
 		if err != nil {
-			c.log.Errorf("failed to unpack image '%s': %v", img.Name(), err)
+			c.log.Errorf("failed to unpack image '%s': %v", img.Name, err)
 			return "", err
 		}
-		c.log.Infof("Successfully unpacked image '%s'", img.Name())
+		c.log.Infof("Successfully unpacked image '%s'", img.Name)
 	}
 
 	var parent string
@@ -120,18 +120,18 @@ func (c *OCIStore) Mount(img client.Image, target string, key string, readonly b
 	if img == nil {
 		parent = ""
 	} else {
-		diffIDs, err := img.RootFS(ctx)
+		diffIDs, err := img.RootFS(ctx, c.cs, c.platform)
 		if err != nil {
-			c.log.Errorf("failed to get diff IDs of the image '%s': %v", img.Name(), err)
+			c.log.Errorf("failed to get diff IDs of the image '%s': %v", img.Name, err)
 			return "", err
 		}
 		parent = identity.ChainID(diffIDs).String()
 		labels = map[string]string{
-			LabelSnapshotImgRef: img.Name(),
+			LabelSnapshotImgRef: img.Name,
 		}
 	}
 
-	sn := c.cli.SnapshotService(c.driver)
+	sn := c.snaps[c.driver]
 
 	sOpts := append(mOpt.sOpts, snapshots.WithLabels(labels))
 
@@ -147,7 +147,7 @@ func (c *OCIStore) Mount(img client.Image, target string, key string, readonly b
 			mounts, err = sn.Mounts(ctx, key)
 		}
 		if err != nil {
-			c.log.Errorf("failed to create an active commit for image '%s': %v", img.Name(), err)
+			c.log.Errorf("failed to create an active commit for image '%s': %v", img.Name, err)
 			return "", err
 		}
 	}
@@ -156,7 +156,7 @@ func (c *OCIStore) Mount(img client.Image, target string, key string, readonly b
 		if err := sn.Remove(ctx, key); err != nil && !errdefs.IsNotFound(err) {
 			c.log.Errorf("error cleaning up snapshot after mount error: %v", err)
 		}
-		c.log.Errorf("failed to mount image '%s': %v", img.Name(), err)
+		c.log.Errorf("failed to mount image '%s': %v", img.Name, err)
 		return "", err
 	}
 
@@ -177,7 +177,7 @@ func (c *OCIStore) Umount(target string, key string, removeSnap int) (retErr err
 		return nil
 	}
 
-	ctx, done, err := c.cli.WithLease(c.ctx)
+	ctx, done, err := c.WithLease(leases.WithRandomID(), leases.WithExpiration(1*time.Hour))
 	if err != nil {
 		c.log.Errorf("failed to create lease to umount snapshot: %v", err)
 		return err
@@ -189,10 +189,10 @@ func (c *OCIStore) Umount(target string, key string, removeSnap int) (retErr err
 		}
 	}()
 
-	if err := c.cli.LeasesService().Delete(ctx, leases.Lease{ID: key}); err != nil && !errdefs.IsNotFound(err) {
+	if err := c.lm.Delete(ctx, leases.Lease{ID: key}); err != nil && !errdefs.IsNotFound(err) {
 		return fmt.Errorf("error deleting lease: %w", err)
 	}
-	s := c.cli.SnapshotService(c.driver)
+	s := c.snaps[c.driver]
 
 	// TODO should we run a snapshotter cleanup after snapshots removal?
 	// Remove up to a certain level of childs
