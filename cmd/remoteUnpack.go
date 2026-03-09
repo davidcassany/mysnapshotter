@@ -27,10 +27,14 @@ var rUnpackCmd = &cobra.Command{
 	Args:    cobra.ExactArgs(1),
 	PreRunE: initCS,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return cs.RemoteUnpack(args[0])
+		flags := cmd.Flags()
+		skipTLS, _ := flags.GetBool("skip-tls")
+		return cs.RemoteUnpack(args[0], skipTLS)
 	},
 }
 
 func init() {
 	rootCmd.AddCommand(rUnpackCmd)
+
+	rUnpackCmd.Flags().Bool("skip-tls", false, "skips TLS verification")
 }

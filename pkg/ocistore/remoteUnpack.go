@@ -19,6 +19,7 @@ package ocistore
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,7 +59,7 @@ import (
 
 const ActiveSnap = "activeSnap"
 
-func (c *OCIStore) RemoteUnpack(ref string, opts ...ApplyCommitOpt) (err error) {
+func (c *OCIStore) RemoteUnpack(ref string, skipTLS bool) (err error) {
 	if !c.IsInitiated() {
 		return errors.New(missInitErrMsg)
 	}
@@ -75,8 +76,8 @@ func (c *OCIStore) RemoteUnpack(ref string, opts ...ApplyCommitOpt) (err error) 
 		}
 	}()
 
-	// TODO verify it handles authorization
-	resolver := setupResolver()
+	// TODO verify how it handles authorization
+	resolver := setupResolver(skipTLS)
 
 	name, desc, err := resolver.Resolve(c.ctx, ref)
 	if err != nil {
@@ -109,6 +110,7 @@ func (c *OCIStore) RemoteUnpack(ref string, opts ...ApplyCommitOpt) (err error) 
 		// TODO figure out if we need some additional labels
 	}
 
+	// TODO handle a proper cleanup
 	is := c.cli.ImageService()
 	for {
 		if created, err := is.Create(ctx, img); err != nil {
@@ -822,19 +824,25 @@ func (rt *rangeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 // setupResolver creates a new resolver with a custom http client with the http.RoundTripper
 // to support ranged http requests.
 // TODO: expose resolver configuration options as optional parametres
-func setupResolver() remotes.Resolver {
+func setupResolver(skipTLSVerify bool) remotes.Resolver {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+
+	if skipTLSVerify {
+		if transport.TLSClientConfig == nil {
+			transport.TLSClientConfig = &tls.Config{}
+		}
+		transport.TLSClientConfig.InsecureSkipVerify = true
+	}
+
 	customClient := &http.Client{
 		Transport: &rangeRoundTripper{
-			Base: http.DefaultTransport,
+			Base: transport,
 		},
 	}
 
 	// Initialize the resolver with our customized client
 	opts := docker.ResolverOptions{
-		Client: customClient,
-		// You can also add your registry hosts / auth configurations here
-		// TODO: I don't know why adding this causes to ignore the custom client
-		//Hosts: docker.ConfigureDefaultRegistries(),
+		Hosts: docker.ConfigureDefaultRegistries(docker.WithClient(customClient)),
 	}
 
 	return docker.NewResolver(opts)
