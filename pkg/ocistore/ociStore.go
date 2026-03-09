@@ -55,9 +55,9 @@ const (
 	// TopLevelBucket isolates our custom data from containerd's bucket
 	// we don't want to mess with containerd's DB and potentially corrupt it or break
 	// containerd updates
-	TopLevelBucket      = "zstd-cache"
-	ChunkLocBucket      = "chunk-locations"
-	SnapshotChunkBucket = "snapshot-chunks"
+	TopLevelBucket = "zstd-cache"
+	LocBucket      = "digest-locations"
+	SnapshotBucket = "snapshot-digests"
 )
 
 type OCIStore struct {
@@ -220,12 +220,12 @@ func initZstdCacheBuckets(db *bolt.DB) error {
 		}
 
 		// 2. Create the Forward Index (Chunk Digest -> Paths)
-		if _, err := root.CreateBucketIfNotExists([]byte(ChunkLocBucket)); err != nil {
+		if _, err := root.CreateBucketIfNotExists([]byte(LocBucket)); err != nil {
 			return fmt.Errorf("failed to create chunk locations bucket: %w", err)
 		}
 
 		// 3. Create the Reverse Index (Snapshot ID -> Chunk Digests)
-		if _, err := root.CreateBucketIfNotExists([]byte(SnapshotChunkBucket)); err != nil {
+		if _, err := root.CreateBucketIfNotExists([]byte(SnapshotBucket)); err != nil {
 			return fmt.Errorf("failed to create snapshot chunks bucket: %w", err)
 		}
 

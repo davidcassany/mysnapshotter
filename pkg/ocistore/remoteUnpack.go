@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -54,6 +55,8 @@ import (
 	bolt "go.etcd.io/bbolt"
 	"golang.org/x/sys/unix"
 )
+
+const ActiveSnap = "activeSnap"
 
 func (c *OCIStore) RemoteUnpack(ref string, opts ...ApplyCommitOpt) (err error) {
 	if !c.IsInitiated() {
@@ -273,9 +276,9 @@ func unpackRemoteLayers(ctx context.Context, log logger.Logger, fetcher remotes.
 
 		if toc != nil {
 			// 6. Perform and optimized download and extraction based on zstd:chunked
-			missing, cached, nodes := processTOC(log, bdb, toc, tocOffset)
+			pTOC := processTOC(log, bdb, toc, tocOffset)
 			callback := func(root string) error {
-				return unpackZstdChunkedLayer(ctx, log, bdb, fetcher, layerDesc, nodes, missing, cached, root)
+				return unpackZstdChunkedLayer(ctx, log, bdb, fetcher, layerDesc, pTOC, root, currentChainID, sn)
 			}
 			err = runAtMountsStack(ctx, mounts, callback)
 			if err != nil {
@@ -309,8 +312,15 @@ func unpackRemoteLayers(ctx context.Context, log logger.Logger, fetcher remotes.
 	return nil
 }
 
-func fetchAndApplyBlobRanges(ctx context.Context, log logger.Logger, fetcher remotes.Fetcher, layerDesc ocispec.Descriptor, root string, ranges []*byteRangeGroup) (err error) {
+func fetchAndApplyBlobRanges(ctx context.Context, log logger.Logger, fetcher remotes.Fetcher, layerDesc ocispec.Descriptor, root string, pTOC *processedTOC) (err error) {
 	var currentStreamPos int64
+	var ranges []*byteRangeGroup
+
+	// TODO we could also group missing files based on range size to parallelize the download and extraction of big layers
+	ranges = groupMissingFiles(pTOC.missingFiles)
+
+	log.Debugf("coalesced the range of %d files into %d multifile ranges", len(pTOC.missingFiles), len(ranges))
+
 	for _, blobRange := range ranges {
 		// fetch the range as a new compressed stream, the new compressed stream starts reading from position 0
 		rc, err := fetchRange(ctx, fetcher, layerDesc, blobRange.StartOffset, blobRange.EndOffset-blobRange.StartOffset+1)
@@ -339,7 +349,7 @@ func fetchAndApplyBlobRanges(ctx context.Context, log logger.Logger, fetcher rem
 
 			err = decompressFile(log, rc, zstdFile, root)
 			if err != nil {
-				return fmt.Errorf("decompressing file (%s) from zstd:chunked file range: %w", zstdFile.entry.Name, err)
+				return fmt.Errorf("decompressing file (%s) from zstd:chunked file range: %w", zstdFile.Entry.Name, err)
 			}
 
 			// update stream position, this is needed to jump gaps
@@ -352,13 +362,13 @@ func fetchAndApplyBlobRanges(ctx context.Context, log logger.Logger, fetcher rem
 // TODO limit rc to read only (no close) and limit outFile to io.Writer
 func decompressFile(log logger.Logger, rc io.ReadCloser, zstdFile *tocFile, root string) (err error) {
 	// remove target file if already exists and recreate it as an empty file
-	path := filepath.Join(root, zstdFile.entry.Name)
+	path := filepath.Join(root, zstdFile.Entry.Name)
 	err = os.Remove(path)
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
 
-	outFile, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(zstdFile.entry.Mode))
+	outFile, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(zstdFile.Entry.Mode))
 	if err != nil {
 		return err
 	}
@@ -368,7 +378,7 @@ func decompressFile(log logger.Logger, rc io.ReadCloser, zstdFile *tocFile, root
 			err = fmt.Errorf("closing output file %s: %w", path, cErr)
 		}
 		if err == nil {
-			err = applyMetadata(path, zstdFile.entry)
+			err = applyMetadata(path, zstdFile.Entry)
 			if err != nil {
 				err = fmt.Errorf("applying metadata to file %s: %w", path, err)
 			}
@@ -379,17 +389,17 @@ func decompressFile(log logger.Logger, rc io.ReadCloser, zstdFile *tocFile, root
 	rangeReader := io.LimitReader(rc, zstdFile.Range.Size)
 	decompressedStream, err := zstd.NewReader(rangeReader)
 	if err != nil {
-		return fmt.Errorf("uncompressing stream for file %s", zstdFile.entry.Name)
+		return fmt.Errorf("uncompressing stream for file %s", zstdFile.Entry.Name)
 	}
 	defer decompressedStream.Close()
 
 	// limit the copy to skip tar headers
-	written, err := io.CopyN(outFile, decompressedStream, zstdFile.entry.Size)
-	if written != zstdFile.entry.Size {
-		log.Warnf("written bytes (%d) not matching expected size (%d)", written, zstdFile.entry.Size)
+	written, err := io.CopyN(outFile, decompressedStream, zstdFile.Entry.Size)
+	if written != zstdFile.Entry.Size {
+		log.Warnf("written bytes (%d) not matching expected size (%d)", written, zstdFile.Entry.Size)
 	}
 	if err != nil {
-		return fmt.Errorf("writing bytes for file %s: %w", zstdFile.entry.Name, err)
+		return fmt.Errorf("writing bytes for file %s: %w", zstdFile.Entry.Name, err)
 	}
 	// discard tar headers
 	_, err = io.Copy(io.Discard, decompressedStream)
@@ -401,22 +411,151 @@ func decompressFile(log logger.Logger, rc io.ReadCloser, zstdFile *tocFile, root
 	if err != nil {
 		return fmt.Errorf("discarting bytes from uncompressed stream: %w", err)
 	}
-	// TODO set xattr to the file
 	return nil
 }
 
-func applyCachedFiles(ctx context.Context, log logger.Logger, cached []*tocFile, root string) error {
+func applyCachedFiles(ctx context.Context, log logger.Logger, sn snapshots.Snapshotter, pTOC *processedTOC, root string) error {
+	var appliedIdx int
+	applied := make([]int, len(pTOC.cachedFiles))
+
+	onSnapshotCallback := func(snapshotKey string) func(snapRoot string) error {
+		return func(snapRoot string) error {
+			var mErr error
+			for _, idx := range pTOC.reverseCacheIdx[snapshotKey] {
+				if idx >= len(pTOC.cachedFiles) {
+					log.Warnf("inconsistend index found in reverse cache index: %d", idx)
+					continue
+				}
+				if slices.Contains(applied, idx) {
+					continue
+				}
+
+				var src, tgt string
+				tgt = filepath.Join(root, pTOC.cachedFiles[idx].Entry.Name)
+				srcPaths := pTOC.cachedFiles[idx].CachedPaths.GetPathsBySnapshot(snapshotKey)
+				for _, srcPath := range srcPaths {
+					src = filepath.Join(snapRoot, srcPath)
+					if err := reflinkOrCopy(tgt, src, pTOC.cachedFiles[idx].Entry); err == nil {
+						applied[appliedIdx] = idx
+						appliedIdx++
+						break
+					} else {
+						mErr = errors.Join(mErr, err)
+					}
+				}
+			}
+			return mErr
+		}
+	}
+
+	var errs error
+	for snapshotKey := range maps.Keys(pTOC.reverseCacheIdx) {
+		callback := onSnapshotCallback(snapshotKey)
+		if snapshotKey == ActiveSnap {
+			// these are a duplicted files within the same remote layer, just downloaded one
+			// other are applied from the already extrated remote files
+			errs = errors.Join(errs, callback(root))
+			continue
+		}
+		mnts, err := sn.View(ctx, snapshotKey, "")
+		if err != nil {
+			errs = errors.Join(errs, err)
+			log.Warnf("something went wrong preparing snapshot %s: %s", snapshotKey, err.Error())
+			continue
+		}
+		errs = errors.Join(errs, runAtMountsStack(ctx, mnts, callback))
+	}
+
+	if errs != nil {
+		return fmt.Errorf("one or more erros occurred applying cached files: %w", errs)
+	}
+
+	log.Debugf("applied %d files from cache", len(applied))
+	if appliedIdx != len(pTOC.cachedFiles)-1 {
+		return fmt.Errorf("applied %d files, but we were expecting to apply %d", appliedIdx+1, len(pTOC.cachedFiles))
+	}
 	return nil
 }
 
-func updateZstdCacheDB(ctx context.Context, log logger.Logger, bdb *bolt.DB, missing []*byteRangeGroup, cached []*tocFile) error {
+func reflinkOrCopy(target, source string, entry *estargz.TOCEntry) (err error) {
+	src, err := os.Open(source)
+	if err != nil {
+		return fmt.Errorf("opening file %s: %w", source, err)
+	}
+	defer func() {
+		cErr := src.Close()
+		if err == nil && cErr != nil {
+			err = cErr
+		}
+	}()
+
+	srcInfo, err := src.Stat()
+	if err != nil {
+		return fmt.Errorf("stat file %s: %w", source, err)
+	}
+
+	if !srcInfo.Mode().IsRegular() {
+		return fmt.Errorf("non-regular source file: %s", source)
+	}
+
+	// Create destination with same permissions initially
+	dst, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(0700))
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if err != nil {
+			dst.Close()
+			os.Remove(target)
+		}
+	}()
+
+	// Attempt reflink clone
+	err = unix.IoctlFileClone(int(dst.Fd()), int(src.Fd()))
+	if err != nil {
+		// If reflink unsupported or cross-device, fallback
+		if errors.Is(err, unix.EOPNOTSUPP) ||
+			errors.Is(err, unix.EXDEV) ||
+			errors.Is(err, unix.EINVAL) {
+
+			// Reset file offset before copy
+			if _, seekErr := src.Seek(0, 0); seekErr != nil {
+				return fmt.Errorf("seeking file %s before copying: %w", source, err)
+			}
+
+			if _, copyErr := io.Copy(dst, src); copyErr != nil {
+				return fmt.Errorf("copying %s to %s: %w", source, target, err)
+			}
+		} else {
+			return fmt.Errorf("reflinking from %s to %s: %w", source, target, err)
+		}
+	}
+
+	// Sync to ensure durability
+	err = dst.Sync()
+	if err != nil {
+		return fmt.Errorf("synching target file %s: %w", target, err)
+	}
+
+	err = dst.Close()
+	if err != nil {
+		return fmt.Errorf("closing file %s: %w", target, err)
+	}
+
+	err = applyMetadata(target, entry)
+	if err != nil {
+		return fmt.Errorf("applying metadata to target file %s: %w", target, err)
+	}
+
 	return nil
 }
 
-func createStructuralNodes(ctx context.Context, log logger.Logger, nodes []*estargz.TOCEntry, root string) (pending []*estargz.TOCEntry, err error) {
+func createStructuralNodes(log logger.Logger, pTOC *processedTOC, root string) (pending []*estargz.TOCEntry, err error) {
 	var path string
 
 	// sort paths to ensure we are starting from parent directories
+	nodes := pTOC.structure
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Name < nodes[j].Name })
 
 	for _, e := range nodes {
@@ -539,7 +678,7 @@ func applyMetadata(targetPath string, entry *estargz.TOCEntry) error {
 	return nil
 }
 
-func applyPendingNodes(ctx context.Context, log logger.Logger, pending []*estargz.TOCEntry, root string) error {
+func applyPendingNodes(log logger.Logger, pending []*estargz.TOCEntry, root string) error {
 	var path string
 	var err error
 
@@ -574,35 +713,37 @@ func applyPendingNodes(ctx context.Context, log logger.Logger, pending []*estarg
 }
 
 func unpackZstdChunkedLayer(
-	ctx context.Context, log logger.Logger, bdb *bolt.DB, fetcher remotes.Fetcher, desc ocispec.Descriptor,
-	nodes []*estargz.TOCEntry, missing []*byteRangeGroup, cached []*tocFile, root string,
+	ctx context.Context, log logger.Logger, bdb *bolt.DB, fetcher remotes.Fetcher,
+	desc ocispec.Descriptor, pTOC *processedTOC, root, snapshotKey string, sn snapshots.Snapshotter,
 ) error {
 	// 6.2 Create all special nodes
-	pending, err := createStructuralNodes(ctx, log, nodes, root)
+	pending, err := createStructuralNodes(log, pTOC, root)
 	if err != nil {
 		return err
 	}
 
+	// TODO fetches could be parallelized for simultaneous downloads and extractions
 	// 6.3 fetch and extract missing files
-	err = fetchAndApplyBlobRanges(ctx, log, fetcher, desc, root, missing)
+	err = fetchAndApplyBlobRanges(ctx, log, fetcher, desc, root, pTOC)
 	if err != nil {
 		return err
 	}
 
+	// TODO reflinking cached files could be parallelized too, checking out if it is worth or not would be interesting
 	// 6.4 appplied cached files
-	err = applyCachedFiles(ctx, log, cached, root)
+	err = applyCachedFiles(ctx, log, sn, pTOC, root)
 	if err != nil {
 		return err
 	}
 
 	// 6.5 handle hardlinks and directories metadata in reverse order
-	err = applyPendingNodes(ctx, log, pending, root)
+	err = applyPendingNodes(log, pending, root)
 	if err != nil {
 		return err
 	}
 
 	// 6.6 Update cache DB
-	err = updateZstdCacheDB(ctx, log, bdb, missing, cached)
+	err = updateZstdCacheDB(log, bdb, pTOC, snapshotKey)
 	if err != nil {
 		return err
 	}
@@ -778,15 +919,38 @@ func fetchZstdTOC(ctx context.Context, log logger.Logger, layerDesc ocispec.Desc
 // tocFile represents an entire file, aggregating the bytes range of the initial
 // reg entry and any subsequent chunk entries
 type tocFile struct {
-	entry       *estargz.TOCEntry
-	IsCacheHit  bool
-	CachedPaths []string
+	Entry       *estargz.TOCEntry
+	CachedPaths cachedPaths
 	Range       *byteRange
 }
+
+type cachedPath struct {
+	SnapshotKey string
+	Paths       []string
+}
+
+type cachedPaths []*cachedPath
 
 type byteRange struct {
 	Offset int64
 	Size   int64
+}
+
+type processedTOC struct {
+	// missing files listed by ascending byte range, these are meant to be fetched from the remote layer
+	missingFiles []*tocFile
+
+	// already cached files listed by ascending byte range, these are meant to be found in the system already
+	cachedFiles []*tocFile
+
+	// keys are snapshotKeys and the value is a list of indexes in cachedFiles
+	reverseCacheIdx map[string][]int
+
+	// index of TOC files ascessible by digest (only missing or cached TOC files)
+	digestsIdx map[string][]*tocFile
+
+	// these are structural nodes manually created (dirs, symlinks, hardlinks, devices, etc.)
+	structure []*estargz.TOCEntry
 }
 
 // byteRangeGroup represents a coalesced HTTP Range request for one or more files
@@ -796,21 +960,61 @@ type byteRangeGroup struct {
 	Files       []*tocFile
 }
 
-func processTOC(log logger.Logger, bdb *bolt.DB, toc *estargz.JTOC, tocOffset int64) (ranges []*byteRangeGroup, cached []*tocFile, specialNodes []*estargz.TOCEntry) {
+func (cps cachedPaths) GetPathsBySnapshot(snapshotKey string) []string {
+	for _, cp := range cps {
+		if cp.SnapshotKey == snapshotKey {
+			return cp.Paths
+		}
+	}
+	return []string{}
+}
+
+func (cps cachedPaths) AddCachedPaths(snapshotKey string, paths ...string) (cachedPaths, bool) {
+	var updated bool
+	for _, cp := range cps {
+		if cp.SnapshotKey == snapshotKey {
+			for _, path := range paths {
+				if !slices.Contains(cp.Paths, path) {
+					cp.Paths = append(cp.Paths, path)
+					updated = true
+				}
+			}
+			return cps, updated
+		}
+	}
+	return append(cps, &cachedPath{SnapshotKey: snapshotKey, Paths: paths}), true
+}
+
+// TODO we are not optimizing any duplicate files that could be in the same layer, we are not detecting those
+// probably we could pre-cache before fetching
+func processTOC(log logger.Logger, bdb *bolt.DB, toc *estargz.JTOC, tocOffset int64) *processedTOC {
 	var active *tocFile
-	var missing []*tocFile
+	var missing, cached []*tocFile
+	var structure []*estargz.TOCEntry
+	digests := map[string][]*tocFile{}
+	reverseIdx := map[string][]int{}
 
 	// Helper function to evaluate the fully grouped file
 	queueActiveFile := func(file *tocFile) {
-		if file.IsCacheHit {
+		if len(file.CachedPaths) > 0 {
 			// Cache Hit: The whole file is cached. Ignore the chunks and queue the reflink.
 			cached = append(cached, file)
+			for _, cp := range file.CachedPaths {
+				idxs := reverseIdx[cp.SnapshotKey]
+				if len(idxs) == 0 {
+					reverseIdx[cp.SnapshotKey] = []int{len(cached) - 1}
+				} else {
+					reverseIdx[cp.SnapshotKey] = append(idxs, len(cached)-1)
+				}
+			}
 		} else {
 			// Cache Miss: Queue the range chunk for download.
 			missing = append(missing, file)
 		}
 	}
 
+	// TODO probably it can be assumed this is already the case, it doesn't make
+	// sense the entry list if they are not sorted by range
 	sort.Slice(toc.Entries, func(i, j int) bool {
 		return toc.Entries[i].Offset < toc.Entries[j].Offset
 	})
@@ -823,45 +1027,57 @@ func processTOC(log logger.Logger, bdb *bolt.DB, toc *estargz.JTOC, tocOffset in
 			nextOffset = toc.Entries[i+1].Offset
 		}
 
-		// 1. If it's a chunk, append it to the currently active file
+		// if it's a chunk, append it to the currently active file
 		if entry.Type == "chunk" {
-			if active != nil && active.entry.Name == entry.Name {
+			if active != nil && active.Entry.Name == entry.Name {
 				active.Range.Size = nextOffset - active.Range.Offset
 			}
 			continue
 		}
 
-		// 2. If we reach a new file/node, the previous activeFile is fully grouped
+		// if we reach a new file/node, the previous activeFile is fully grouped
 		if active != nil {
 			queueActiveFile(active)
 			active = nil // Reset
 		}
 
-		// 3. Handle the new entry based on its type
+		// handle the new entry based on its type
 		switch entry.Type {
 		case "reg":
 			if entry.Size == 0 || entry.Digest == "" {
-				specialNodes = append(specialNodes, entry)
+				structure = append(structure, entry)
 				continue
 			}
-			// Query bbolt using the WHOLE file digest
-			paths, err := getCachedPaths(bdb, entry.Digest)
+			// query bbolt using the whole file digest
+			paths, err := getDigest(bdb, entry.Digest)
 			if err != nil {
 				log.Warnf("error getting cached paths for digest %s, considering it a cache miss. err: %s", entry.Digest, err.Error())
 			}
 
+			// The 'reg' entry contains the first chunk's payload coordinates
 			active = &tocFile{
-				entry:       entry,
-				IsCacheHit:  len(paths) > 0,
+				Entry:       entry,
 				CachedPaths: paths,
 				Range: &byteRange{
 					Offset: entry.Offset,
 					Size:   nextOffset - entry.Offset,
-				}, // The 'reg' entry contains the first chunk's payload coordinates
+				},
 			}
 
+			// consider duplicated missing digests as cached data
+			refs := digests[entry.Digest]
+			if len(refs) == 0 {
+				digests[entry.Digest] = []*tocFile{active}
+			} else {
+				if len(paths) == 0 {
+					// pre-cached from active the snapshot, this is a duplicated file inside the same TOC
+					// do not track all duplicate refrences, they will only point to the first match
+					active.CachedPaths, _ = active.CachedPaths.AddCachedPaths(ActiveSnap, digests[entry.Digest][0].Entry.Name)
+				}
+				digests[entry.Digest] = append(refs, active)
+			}
 		case "dir", "symlink", "hardlink", "char", "block", "fifo":
-			specialNodes = append(specialNodes, entry)
+			structure = append(structure, entry)
 		}
 	}
 
@@ -869,12 +1085,17 @@ func processTOC(log logger.Logger, bdb *bolt.DB, toc *estargz.JTOC, tocOffset in
 	if active != nil {
 		queueActiveFile(active)
 	}
-	ranges = groupMissingFiles(missing)
 
-	log.Debugf("collected %d individual missing ranges, but coalesced them to %d missing ranges", len(missing), len(ranges))
-	log.Debugf("collected %d reflink tasks", len(cached))
+	log.Debugf("collected %d missing files", len(missing))
+	log.Debugf("collected %d cached files", len(cached))
 
-	return ranges, cached, specialNodes
+	return &processedTOC{
+		missingFiles:    missing,
+		cachedFiles:     cached,
+		reverseCacheIdx: reverseIdx,
+		digestsIdx:      digests,
+		structure:       structure,
+	}
 }
 
 func groupMissingFiles(misses []*tocFile) []*byteRangeGroup {
@@ -929,27 +1150,27 @@ func groupMissingFiles(misses []*tocFile) []*byteRangeGroup {
 	return groups
 }
 
-// getCachedPaths returns a list of local paths where the uncompressed chunk resides
-func getCachedPaths(bdb *bolt.DB, chunkDigest string) ([]string, error) {
-	var paths []string
+// getDigest returns a map of snapshot keys containing the digest, each snapshot key points
+// to a list of paths
+func getDigest(bdb *bolt.DB, digest string) (cachedPaths, error) {
+	paths := cachedPaths{}
 
 	err := bdb.View(func(tx *bolt.Tx) error {
-		// Traverse the bucket hierarchy safely
 		root := tx.Bucket([]byte(TopLevelBucket))
 		if root == nil {
 			return nil // Cache doesn't exist yet
 		}
 
-		locBucket := root.Bucket([]byte(ChunkLocBucket))
+		locBucket := root.Bucket([]byte(LocBucket))
 		if locBucket == nil {
 			return nil
 		}
 
 		// Fetch the JSON array
-		data := locBucket.Get([]byte(chunkDigest))
+		data := locBucket.Get([]byte(digest))
 		if data != nil {
 			if err := json.Unmarshal(data, &paths); err != nil {
-				return err
+				return fmt.Errorf("unmarshalling matched data: %w", err)
 			}
 		}
 		return nil
@@ -958,38 +1179,65 @@ func getCachedPaths(bdb *bolt.DB, chunkDigest string) ([]string, error) {
 	return paths, err
 }
 
-// recordChunk updates the cache to link a chunk digest to its new physical path
-func recordChunk(db *bolt.DB, snapshotKey string, chunkDigest string, newPath string) error {
+func updateZstdCacheDB(log logger.Logger, db *bolt.DB, pTOC *processedTOC, snapshotKey string) error {
 	return db.Update(func(tx *bolt.Tx) error {
 		root := tx.Bucket([]byte(TopLevelBucket))
-		locBucket := root.Bucket([]byte(ChunkLocBucket))
-		snapBucket := root.Bucket([]byte(SnapshotChunkBucket))
+		locBucket := root.Bucket([]byte(LocBucket))
+		snapBucket := root.Bucket([]byte(SnapshotBucket))
 
-		// --- 1. Update Forward Index ---
-		var paths []string
-		if data := locBucket.Get([]byte(chunkDigest)); data != nil {
-			json.Unmarshal(data, &paths)
-		}
+		// TODO figure out if there is a better approach
+		// We assume there will be a huge sequencial append
+		root.FillPercent = 1.0
+		locBucket.FillPercent = 1.0
+		snapBucket.FillPercent = 1.0
 
-		// Deduplicate: Ensure we don't add the same path twice
-		pathExists := slices.Contains(paths, newPath)
-		if !pathExists {
-			paths = append(paths, newPath)
-			encodedPaths, _ := json.Marshal(paths)
-			locBucket.Put([]byte(chunkDigest), encodedPaths)
-		}
+		digestKeys := slices.Collect(maps.Keys(pTOC.digestsIdx))
+		slices.Sort(digestKeys)
 
-		// --- 2. Update Reverse Index ---
-		var digests []string
+		log.Debugf("there are %d digests to update or create", len(digestKeys))
+
+		snapDgsts := []string{}
 		if data := snapBucket.Get([]byte(snapshotKey)); data != nil {
-			json.Unmarshal(data, &digests)
+			err := json.Unmarshal(data, &snapDgsts)
+			if err != nil {
+				return fmt.Errorf("unmarshalling snapshots reverse index for %s: %w", snapshotKey, err)
+			}
 		}
 
-		digestExists := slices.Contains(digests, chunkDigest)
-		if !digestExists {
-			digests = append(digests, chunkDigest)
-			encodedDigests, _ := json.Marshal(digests)
-			snapBucket.Put([]byte(snapshotKey), encodedDigests)
+		log.Debugf("snapshot %s has %d digests already cached", snapshotKey, len(snapDgsts))
+
+		for _, digest := range digestKeys {
+			tocFs := pTOC.digestsIdx[digest]
+			newPaths := []string{}
+			for _, tocF := range tocFs {
+				newPaths = append(newPaths, tocF.Entry.Name)
+			}
+
+			paths := cachedPaths{}
+			if data := locBucket.Get([]byte(digest)); data != nil {
+				err := json.Unmarshal(data, &paths)
+				if err != nil {
+					return fmt.Errorf("unmarshalling cached digest (%s) before updating: %w", digest, err)
+				}
+			}
+			paths, _ = paths.AddCachedPaths(snapshotKey, newPaths...)
+			encodedPaths, _ := json.Marshal(paths)
+			err := locBucket.Put([]byte(digest), encodedPaths)
+			if err != nil {
+				return fmt.Errorf("writing paths (%v) to the cache database: %w", newPaths, err)
+			}
+
+			if !slices.Contains(snapDgsts, digest) {
+				snapDgsts = append(snapDgsts, digest)
+			}
+		}
+
+		log.Debugf("setting %d digests to snapshot %s", len(snapDgsts), snapshotKey)
+
+		encodedDigests, _ := json.Marshal(snapDgsts)
+		err := snapBucket.Put([]byte(snapshotKey), encodedDigests)
+		if err != nil {
+			return fmt.Errorf("writing digests for snapshot %s: %w", snapshotKey, err)
 		}
 
 		return nil
