@@ -19,25 +19,48 @@ package ocistore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/leases"
+	"github.com/containerd/errdefs"
 	"github.com/opencontainers/image-spec/identity"
 )
 
-func (c *OCIStore) Get(ref string) (client.Image, error) {
+func (c *OCIStore) Get(ctx context.Context, ref string) (*images.Image, error) {
 	if !c.IsInitiated() {
 		return nil, errors.New(missInitErrMsg)
 	}
 
-	img, err := c.cli.GetImage(c.ctx, ref)
+	c.log.Debugf("Looking for image %q in image store", ref)
+	img, err := c.is.Get(ctx, ref)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("getting image '%s' from store: %w", ref, err)
 	}
+	c.log.Infof("Image %q found", ref)
+	return &img, nil
+}
 
-	return img, nil
+func (c *OCIStore) isUnpacked(ctx context.Context, img *images.Image) (bool, error) {
+	if !c.IsInitiated() {
+		return false, errors.New(missInitErrMsg)
+	}
+	if img == nil {
+		return false, fmt.Errorf("nil image")
+	}
+	diffIDs, err := img.RootFS(ctx, c.cs, c.platform)
+	if err != nil {
+		return false, fmt.Errorf("getting image rootfs: %w", err)
+	}
+	_, err = c.snaps[c.driver].Stat(ctx, identity.ChainID(diffIDs).String())
+	if errdefs.IsNotFound(err) {
+		return false, nil
+	} else if err != nil {
+		return false, fmt.Errorf("looking for image %q in snapshotter: %w", img.Name, err)
+	}
+	return true, nil
 }
 
 func (c *OCIStore) List(filters ...string) ([]client.Image, error) {
@@ -131,12 +154,12 @@ func (c *OCIStore) Create(img images.Image) (_ client.Image, retErr error) {
 }
 
 func (c *OCIStore) delete(ctx context.Context, name string, opts ...images.DeleteOpt) error {
-	img, err := c.cli.GetImage(ctx, name)
+	img, err := c.Get(ctx, name)
 	if err != nil {
 		return err
 	}
-	if ok, err := img.IsUnpacked(ctx, c.driver); ok {
-		diffIDs, err := img.RootFS(ctx)
+	if ok, err := c.isUnpacked(ctx, img); ok {
+		diffIDs, err := img.RootFS(ctx, c.cs, c.platform)
 		if err != nil {
 			return err
 		}

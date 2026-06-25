@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"time"
 
 	"github.com/containerd/containerd/v2/core/leases"
@@ -234,14 +235,9 @@ func (c *OCIStore) removeSnapshotLabels(ctx context.Context, info snapshots.Info
 }
 
 func (c *OCIStore) labelSnapshot(ctx context.Context, info snapshots.Info, labels map[string]string) (snapshots.Info, error) {
-	sLabels := info.Labels
-	if sLabels == nil {
-		sLabels = map[string]string{}
+	if info.Labels == nil {
+		info.Labels = map[string]string{}
 	}
-	for k, v := range labels {
-		sLabels[k] = v
-	}
-	info.Labels = sLabels
-
+	maps.Copy(info.Labels, labels)
 	return c.updateSnapshot(ctx, info)
 }

@@ -29,6 +29,7 @@ import (
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/metadata"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
@@ -69,10 +70,15 @@ type OCIStore struct {
 	namespace string
 	platform  platforms.MatchComparer
 
-	ctx context.Context
-	db  *metadata.DB
-	bdb *bolt.DB
-	cli *client.Client
+	ctx   context.Context
+	db    *metadata.DB
+	bdb   *bolt.DB
+	lm    leases.Manager
+	is    images.Store
+	cs    content.Store
+	ds    client.DiffService
+	snaps map[string]snapshots.Snapshotter
+	cli   *client.Client
 }
 
 func NewOCIStore(log logger.Logger, root string) *OCIStore {
@@ -120,12 +126,17 @@ func (c *OCIStore) Init(mainCtx context.Context) error {
 		return err
 	}
 
+	lm := metadata.NewLeaseManager(db)
+	is := metadata.NewImageStore(db)
+	cs := db.ContentStore()
+	ds := NewDiffService(cs)
+
 	// TODO make client opts configurable
 	cli, err := client.NewWithConn(nil, client.WithServices(
-		client.WithContentStore(db.ContentStore()),
-		client.WithImageStore(metadata.NewImageStore(db)),
-		client.WithLeasesService(metadata.NewLeaseManager(db)),
-		client.WithDiffService(NewDiffService(db.ContentStore())),
+		client.WithContentStore(cs),
+		client.WithImageStore(is),
+		client.WithLeasesService(lm),
+		client.WithDiffService(ds),
 		client.WithSnapshotters(snapshotters),
 	), client.WithDefaultPlatform(c.platform))
 	if err != nil {
@@ -142,11 +153,20 @@ func (c *OCIStore) Init(mainCtx context.Context) error {
 	c.db = db
 	c.cli = cli
 	c.bdb = bdb
+	c.lm = lm
+	c.is = is
+	c.cs = cs
+	c.ds = ds
+	c.snaps = snapshotters
 	return nil
 }
 
 func (c *OCIStore) IsInitiated() bool {
 	return c.ctx != nil
+}
+
+func (c *OCIStore) Ctx() context.Context {
+	return c.ctx
 }
 
 func (c *OCIStore) RunGarbageCollector() error {
@@ -157,6 +177,34 @@ func (c *OCIStore) RunGarbageCollector() error {
 
 	c.log.Debugf("Garbage Collection complete. Elapsed time: %v\n", gcStats.Elapsed())
 	return nil
+}
+
+// WithLease attaches a lease on the OCIStore context
+func (c *OCIStore) WithLease(opts ...leases.Opt) (context.Context, func(context.Context) error, error) {
+	nop := func(context.Context) error { return nil }
+
+	_, ok := leases.FromContext(c.ctx)
+	if ok {
+		return c.ctx, nop, nil
+	}
+
+	if len(opts) == 0 {
+		// Use default lease configuration if no options provided
+		opts = []leases.Opt{
+			leases.WithRandomID(),
+			leases.WithExpiration(24 * time.Hour),
+		}
+	}
+
+	l, err := c.lm.Create(c.ctx, opts...)
+	if err != nil {
+		return c.ctx, nop, err
+	}
+
+	ctx := leases.WithLease(c.ctx, l.ID)
+	return ctx, func(ctx context.Context) error {
+		return c.lm.Delete(ctx, l)
+	}, nil
 }
 
 func (c *OCIStore) GetClient() *client.Client {

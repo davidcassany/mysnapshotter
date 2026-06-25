@@ -17,9 +17,16 @@ limitations under the License.
 package extractor
 
 import (
+	"archive/tar"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
 
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/remotes"
@@ -29,8 +36,6 @@ import (
 	"github.com/containerd/platforms"
 	"github.com/davidcassany/ocistore/pkg/logger"
 	"github.com/davidcassany/ocistore/pkg/ocistore"
-	"github.com/opencontainers/go-digest"
-	"github.com/opencontainers/image-spec/identity"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -49,9 +54,46 @@ type metadata struct {
 	conf *ocispec.Image
 }
 
+// Hardlink tracks links that must be applied after all layers are extracted
+type Hardlink struct {
+	OldPath string
+	NewPath string
+}
+
+func setupResolver(verify bool, opts *docker.ResolverOptions) remotes.Resolver {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+
+	if !verify {
+		if transport.TLSClientConfig == nil {
+			transport.TLSClientConfig = &tls.Config{}
+		}
+		transport.TLSClientConfig.InsecureSkipVerify = true
+	}
+
+	customClient := &http.Client{
+		Transport: transport,
+	}
+
+	// Initialize the resolver with our customized client
+	if opts == nil {
+		opts = &docker.ResolverOptions{
+			Hosts: docker.ConfigureDefaultRegistries(docker.WithClient(customClient)),
+		}
+	} else {
+		opts.Hosts = docker.ConfigureDefaultRegistries(docker.WithClient(customClient))
+	}
+
+	return docker.NewResolver(*opts)
+}
+
 func (e Extractor) ExtractImage(imageRef, destination, platformRef string, local bool, verify bool) (string, error) {
-	// TODO verify it handles authorization
-	resolver := docker.NewResolver(docker.ResolverOptions{})
+	destination, err := filepath.Abs(destination)
+	if err != nil {
+		return "", fmt.Errorf("cannot set destination %q as an absolute path: %w", destination, err)
+	}
+
+	// TODO check if it handles authorization
+	resolver := setupResolver(verify, nil)
 
 	name, desc, err := resolver.Resolve(e.ctx, imageRef)
 	if err != nil {
@@ -82,12 +124,12 @@ func (e Extractor) ExtractImage(imageRef, destination, platformRef string, local
 		return "", fmt.Errorf("failed to find manifest and image config")
 	}
 
-	diffIDs := imgMeta.conf.RootFS.DiffIDs
-	chainIDs := make([]digest.Digest, len(diffIDs))
-	copy(chainIDs, diffIDs)
-	chainIDs = identity.ChainIDs(chainIDs)
+	digest := imgMeta.mfst.Config.Digest.String()
 
-	for _, layerDesc := range imgMeta.mfst.Layers {
+	seenPaths := map[string]bool{}
+	hardlinks := []Hardlink{}
+
+	for _, layerDesc := range slices.Backward(imgMeta.mfst.Layers) {
 		rc, err := fetcher.Fetch(e.ctx, layerDesc)
 		if err != nil {
 			return "", fmt.Errorf("failed to fetch layer %s: %w", layerDesc.Digest, err)
@@ -98,8 +140,10 @@ func (e Extractor) ExtractImage(imageRef, destination, platformRef string, local
 			return "", err
 		}
 
-		// TODO handle whiteouts in some special way?
-		opts := []archive.ApplyOpt{}
+		opts := []archive.ApplyOpt{
+			archive.WithFilter(filterFunc(destination, seenPaths, hardlinks)),
+			archive.WithConvertWhiteout(whiteoutFunc(seenPaths)),
+		}
 		_, err = archive.Apply(e.ctx, destination, uncompressedStream, opts...)
 		uErr := uncompressedStream.Close()
 		if err == nil && uErr != nil {
@@ -114,7 +158,87 @@ func (e Extractor) ExtractImage(imageRef, destination, platformRef string, local
 		}
 	}
 
-	return string(desc.Digest), nil
+	for _, hl := range hardlinks {
+		if err := os.MkdirAll(filepath.Dir(hl.NewPath), 0755); err != nil {
+			return "", fmt.Errorf("failed to create directory for hardlink: %w", err)
+		}
+		if err := os.Link(hl.OldPath, hl.NewPath); err != nil {
+			return "", fmt.Errorf("failed to create hardlink %s -> %s: %w", hl.OldPath, hl.NewPath, err)
+		}
+	}
+
+	return digest, nil
+}
+
+// whiteoutFunc tracks whiteout files and opaque paths as seen, so they are not extracted
+func whiteoutFunc(seenPaths map[string]bool) func(hdr *tar.Header, path string) (bool, error) {
+	return func(hdr *tar.Header, path string) (bool, error) {
+		relPath := filepath.Clean(hdr.Name)
+		baseName := filepath.Base(relPath)
+		dirName := filepath.Dir(relPath)
+
+		if baseName == ".wh..wh..opq" {
+			seenPaths[dirName] = true
+		} else {
+			actualFile := filepath.Join(dirName, strings.TrimPrefix(baseName, ".wh."))
+			seenPaths[actualFile] = true
+		}
+
+		// return false so neither the `.wh.` file is written nor deletion occurs
+		return false, nil
+	}
+}
+
+// filterFunc prevents to extract files that are included in the extracted cache and feeds the extracted cache with files being extracted.
+// It also intercepts all hardlinks for later processing
+func filterFunc(destination string, seenPaths map[string]bool, hardlinks []Hardlink) func(hdr *tar.Header) (bool, error) {
+	return func(hdr *tar.Header) (bool, error) {
+		relPath := filepath.Clean(hdr.Name)
+		if relPath == "." || relPath == "/" {
+			return true, nil
+		}
+
+		// allow whiteouts to pass through to the ConvertWhiteout logic
+		baseName := filepath.Base(relPath)
+		if strings.HasPrefix(baseName, ".wh.") {
+			return true, nil
+		}
+
+		isParentOpaque := func(path string) bool {
+			dir := filepath.Dir(path)
+			for dir != "." && dir != "/" {
+				if seenPaths[dir] {
+					return true
+				}
+				dir = filepath.Dir(dir)
+			}
+			return false
+		}
+
+		// omit if previously seen from an upper layer
+		if seenPaths[relPath] || isParentOpaque(relPath) {
+			return false, nil
+		}
+
+		// mark as seen for subsequent lower layers
+		seenPaths[relPath] = true
+
+		// intercept hardlinks for deferred processing
+		if hdr.Typeflag == tar.TypeLink {
+			oldpath := filepath.Join(destination, hdr.Linkname)
+			if !strings.HasPrefix(oldpath, destination+string(filepath.Separator)) {
+				return false, fmt.Errorf("illegal hardlink target escapes destination directory: %s", hdr.Linkname)
+			}
+			hardlinks = append(hardlinks, Hardlink{
+				NewPath: filepath.Join(destination, relPath),
+				OldPath: oldpath,
+			})
+			return false, nil // Skip native extraction
+		}
+
+		// Extract all other unseen files normally
+		return true, nil
+	}
 }
 
 func fetchManifestAndConfig(log logger.Logger, fetcher remotes.Fetcher, metadata *metadata) images.HandlerFunc {

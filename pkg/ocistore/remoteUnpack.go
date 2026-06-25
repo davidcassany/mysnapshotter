@@ -77,7 +77,7 @@ func (c *OCIStore) RemoteUnpack(ref string, skipTLS bool) (err error) {
 	}()
 
 	// TODO verify how it handles authorization
-	resolver := setupResolver(skipTLS)
+	resolver := SetupOCIRegistryResolver(skipTLS, nil)
 
 	name, desc, err := resolver.Resolve(c.ctx, ref)
 	if err != nil {
@@ -451,7 +451,7 @@ func applyCachedFiles(ctx context.Context, log logger.Logger, sn snapshots.Snaps
 	}
 
 	var errs error
-	for snapshotKey := range maps.Keys(pTOC.reverseCacheIdx) {
+	for snapshotKey := range pTOC.reverseCacheIdx {
 		callback := onSnapshotCallback(snapshotKey)
 		if snapshotKey == ActiveSnap {
 			// these are a duplicted files within the same remote layer, just downloaded one
@@ -459,7 +459,8 @@ func applyCachedFiles(ctx context.Context, log logger.Logger, sn snapshots.Snaps
 			errs = errors.Join(errs, callback(root))
 			continue
 		}
-		mnts, err := sn.View(ctx, snapshotKey, "")
+		//TODO we should provide a randomize key and delete any created snapshot on failure and after the extraction
+		mnts, err := sn.View(ctx, "deleteme", snapshotKey)
 		if err != nil {
 			errs = errors.Join(errs, err)
 			log.Warnf("something went wrong preparing snapshot %s: %s", snapshotKey, err.Error())
@@ -566,9 +567,8 @@ func createStructuralNodes(log logger.Logger, pTOC *processedTOC, root string) (
 		permBits := uint32(goMode & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky))
 		switch e.Type {
 		case "reg":
-			if e.Size != 0 || e.Digest != "" {
-				log.Warn("non zero 'reg' entry type found (%s), ignoring it", e.Name)
-				continue
+			if e.Size != 0 {
+				log.Warnf("non zero 'reg' entry type found (%s) with size %d, treating it as an empty file", e.Name, e.Size)
 			}
 			flags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
 			file, err := os.OpenFile(path, flags, goMode.Perm())
@@ -897,7 +897,7 @@ func fetchZstdTOC(ctx context.Context, log logger.Logger, layerDesc ocispec.Desc
 	_, tocOff, tocSize, err := decompressor.ParseFooter(footerBytes)
 	if err != nil {
 		// We assume this is not of zstd:chunked type and process normally
-		log.Debugf("could not parse zstd TOC from footer: %w", err)
+		log.Debugf("could not parse zstd TOC from footer: %s", err.Error())
 		return nil, tocDgst, 0, nil
 	}
 
