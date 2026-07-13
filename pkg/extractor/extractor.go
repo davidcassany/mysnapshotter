@@ -19,10 +19,8 @@ package extractor
 import (
 	"archive/tar"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -30,7 +28,6 @@ import (
 
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/remotes"
-	"github.com/containerd/containerd/v2/core/remotes/docker"
 	"github.com/containerd/containerd/v2/pkg/archive"
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
 	"github.com/containerd/platforms"
@@ -60,32 +57,6 @@ type Hardlink struct {
 	NewPath string
 }
 
-func setupResolver(verify bool, opts *docker.ResolverOptions) remotes.Resolver {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-
-	if !verify {
-		if transport.TLSClientConfig == nil {
-			transport.TLSClientConfig = &tls.Config{}
-		}
-		transport.TLSClientConfig.InsecureSkipVerify = true
-	}
-
-	customClient := &http.Client{
-		Transport: transport,
-	}
-
-	// Initialize the resolver with our customized client
-	if opts == nil {
-		opts = &docker.ResolverOptions{
-			Hosts: docker.ConfigureDefaultRegistries(docker.WithClient(customClient)),
-		}
-	} else {
-		opts.Hosts = docker.ConfigureDefaultRegistries(docker.WithClient(customClient))
-	}
-
-	return docker.NewResolver(*opts)
-}
-
 func (e Extractor) ExtractImage(imageRef, destination, platformRef string, local bool, verify bool) (string, error) {
 	destination, err := filepath.Abs(destination)
 	if err != nil {
@@ -100,7 +71,7 @@ func (e Extractor) ExtractImage(imageRef, destination, platformRef string, local
 	e.log.Debugf("Extracting image to %s", destination)
 
 	// TODO check if it handles authorization
-	resolver := setupResolver(verify, nil)
+	resolver := ocistore.SetupOCIRegistryResolver(verify, nil)
 
 	name, desc, err := resolver.Resolve(e.ctx, imageRef)
 	if err != nil {

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/remotes"
@@ -29,7 +30,34 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
-func SetupOCIRegistryResolver(verify bool, opts *docker.ResolverOptions) remotes.Resolver {
+// RangeResolver wraps a remotes.Resolver whose HTTP client is configured
+// with rangeRoundTripper. Use its Fetcher method to obtain a RangeFetcher.
+type RangeResolver struct {
+	remotes.Resolver
+}
+
+// Fetcher returns a RangeFetcher for the given image reference.
+func (r *RangeResolver) Fetcher(ctx context.Context, ref string) (RangeFetcher, error) {
+	f, err := r.Resolver.Fetcher(ctx, ref)
+	if err != nil {
+		return RangeFetcher{}, err
+	}
+	return RangeFetcher{inner: f}, nil
+}
+
+// RangeFetcher is a remotes.Fetcher backed by a rangeRoundTripper-enabled
+// HTTP client. Obtain one exclusively via RangeResolver.Fetcher so that
+// FetchRange's range injection is guaranteed to be intercepted.
+type RangeFetcher struct {
+	inner remotes.Fetcher
+}
+
+// Fetch implements remotes.Fetcher.
+func (f RangeFetcher) Fetch(ctx context.Context, desc ocispec.Descriptor) (io.ReadCloser, error) {
+	return f.inner.Fetch(ctx, desc)
+}
+
+func SetupOCIRegistryResolver(verify bool, opts *docker.ResolverOptions) *RangeResolver {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 
 	if !verify {
@@ -40,7 +68,9 @@ func SetupOCIRegistryResolver(verify bool, opts *docker.ResolverOptions) remotes
 	}
 
 	customClient := &http.Client{
-		Transport: transport,
+		Transport: &rangeRoundTripper{
+			Base: transport,
+		},
 	}
 
 	authorizer := docker.NewDockerAuthorizer(
@@ -69,7 +99,7 @@ func SetupOCIRegistryResolver(verify bool, opts *docker.ResolverOptions) remotes
 		opts.Hosts = docker.ConfigureDefaultRegistries(registryOpts...)
 	}
 
-	return docker.NewResolver(*opts)
+	return &RangeResolver{Resolver: docker.NewResolver(*opts)}
 }
 
 // FetchMetadata uses the fetcher to grab a blob and returns blob bytes.
@@ -96,4 +126,54 @@ func FetchMetadata(ctx context.Context, fetcher remotes.Fetcher, desc ocispec.De
 		return nil, fmt.Errorf("reading remote io Reader: %w", err)
 	}
 	return b, nil
+}
+
+// Define a custom type for our context key to avoid collisions
+type rangeContextKey struct{}
+
+// rangeTarget holds the instructions for our RoundTripper
+type rangeTarget struct {
+	Digest string
+	Offset int64
+	Size   int64
+}
+
+// rangeRoundTripper intercepts requests and injects the Range header
+type rangeRoundTripper struct {
+	Base http.RoundTripper
+}
+
+func (rt *rangeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Check if the range target instructions are in the context
+	target, ok := req.Context().Value(rangeContextKey{}).(rangeTarget)
+	if !ok {
+		// Not our target, proceed normally
+		return rt.Base.RoundTrip(req)
+	}
+
+	// Check the request is a GET method including the Digest we want to fetch, then
+	// assume this the request we want to intercept and recreate
+	if strings.Contains(req.URL.Path, target.Digest) && req.Method == http.MethodGet {
+		clonedReq := req.Clone(req.Context())
+		bRange := fmt.Sprintf("bytes=%d-%d", target.Offset, target.Offset+target.Size-1)
+		clonedReq.Header.Set("Range", bRange)
+		return rt.Base.RoundTrip(clonedReq)
+	}
+	return rt.Base.RoundTrip(req)
+}
+
+func FetchRange(ctx context.Context, fetcher RangeFetcher, desc ocispec.Descriptor, offset int64, size int64) (io.ReadCloser, error) {
+	target := rangeTarget{
+		Digest: desc.Digest.Encoded(),
+		Offset: offset,
+		Size:   size,
+	}
+	ctxWithRange := context.WithValue(ctx, rangeContextKey{}, target)
+
+	rc, err := fetcher.Fetch(ctxWithRange, desc)
+	if err != nil {
+		return nil, err
+	}
+
+	return rc, nil
 }
