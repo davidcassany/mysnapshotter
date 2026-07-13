@@ -27,6 +27,7 @@ import (
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/remotes"
 	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/davidcassany/ocistore/pkg/chunked"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -176,4 +177,47 @@ func FetchRange(ctx context.Context, fetcher RangeFetcher, desc ocispec.Descript
 	}
 
 	return rc, nil
+}
+
+func GetToCLocation(ctx context.Context, fetcher RangeFetcher, desc ocispec.Descriptor) (*chunked.TOCLocation, error) {
+	loc, err := chunked.ParseAnnotations(desc.Annotations)
+	if err != nil {
+		//TODO add some logging to notify annotations are missing, not mandatory but desirable
+	}
+
+	r, err := FetchRange(ctx, fetcher, desc, desc.Size-chunked.FooterFrameSize, chunked.FooterFrameSize)
+	if err != nil {
+		return nil, fmt.Errorf("fetching footer frame range: %w", err)
+	}
+	fLoc, err := chunked.ParseFooterFrame(r)
+	cErr := r.Close()
+	if err != nil {
+		return nil, fmt.Errorf("parsing footer frame location: %w", err)
+	}
+	if cErr != nil {
+		return nil, fmt.Errorf("closing range reader: %w", cErr)
+	}
+
+	if loc != nil {
+		if fLoc.Offset != loc.Offset ||
+			fLoc.LengthCompressed != loc.LengthCompressed ||
+			fLoc.LengthUncompressed != loc.LengthUncompressed {
+			return nil, fmt.Errorf("inconsistent chunked annotations compared with the parsed footer")
+		}
+	}
+
+	return fLoc, nil
+}
+
+func FetchToC(ctx context.Context, fetcher RangeFetcher, desc ocispec.Descriptor) (_ *chunked.TOC, err error) {
+	loc, err := GetToCLocation(ctx, fetcher, desc)
+	if err != nil {
+		return nil, err
+	}
+
+	r, err := FetchRange(ctx, fetcher, desc, int64(loc.Offset), int64(loc.LengthCompressed))
+	if err != nil {
+		return nil, fmt.Errorf("fetching footer frame range: %w", err)
+	}
+	return chunked.ParseTOC(r, loc)
 }

@@ -105,47 +105,65 @@ func (e Extractor) ExtractImage(imageRef, destination, platformRef string, local
 	digest := imgMeta.mfst.Config.Digest.String()
 
 	seenPaths := map[string]bool{}
-	hardlinks := []Hardlink{}
 
 	for _, layerDesc := range slices.Backward(imgMeta.mfst.Layers) {
-		rc, err := fetcher.Fetch(e.ctx, layerDesc)
+		toc, err := ocistore.FetchToC(e.ctx, fetcher, layerDesc)
 		if err != nil {
-			return "", fmt.Errorf("failed to fetch layer %s: %w", layerDesc.Digest, err)
+			e.log.Errorf("failed to extract toc: %s", err.Error())
+		} else {
+			e.log.Infof("ToC successfully fetched and parsed! Entries: %d", len(toc.Entries))
 		}
 
-		uncompressedStream, err := compression.DecompressStream(rc)
-		if err != nil {
-			return "", err
-		}
-
-		opts := []archive.ApplyOpt{
-			archive.WithFilter(filterFunc(destination, seenPaths, hardlinks)),
-			archive.WithConvertWhiteout(whiteoutFunc(seenPaths)),
-		}
-		_, err = archive.Apply(e.ctx, destination, uncompressedStream, opts...)
-		uErr := uncompressedStream.Close()
-		if err == nil && uErr != nil {
-			err = uErr
-		}
-		cErr := rc.Close()
-		if err == nil && cErr != nil {
-			err = cErr
-		}
-		if err != nil {
-			return "", fmt.Errorf("failed to apply layer %s: %w", layerDesc.Digest, err)
-		}
-	}
-
-	for _, hl := range hardlinks {
-		if err := os.MkdirAll(filepath.Dir(hl.NewPath), 0755); err != nil {
-			return "", fmt.Errorf("failed to create directory for hardlink: %w", err)
-		}
-		if err := os.Link(hl.OldPath, hl.NewPath); err != nil {
-			return "", fmt.Errorf("failed to create hardlink %s -> %s: %w", hl.OldPath, hl.NewPath, err)
+		if toc == nil {
+			err = fetchAndApplyLayer(e.ctx, fetcher, layerDesc, destination, seenPaths)
+			if err != nil {
+				return "", err
+			}
 		}
 	}
 
 	return digest, nil
+}
+
+func fetchAndApplyLayer(ctx context.Context, fetcher remotes.Fetcher, layer ocispec.Descriptor, destination string, seenPaths map[string]bool) error {
+	rc, err := fetcher.Fetch(ctx, layer)
+	if err != nil {
+		return fmt.Errorf("failed to fetch layer %s: %w", layer.Digest, err)
+	}
+
+	uncompressedStream, err := compression.DecompressStream(rc)
+	if err != nil {
+		return err
+	}
+
+	hardlinks := []Hardlink{}
+	opts := []archive.ApplyOpt{
+		archive.WithFilter(filterFunc(destination, seenPaths, hardlinks)),
+		archive.WithConvertWhiteout(whiteoutFunc(seenPaths)),
+	}
+	_, err = archive.Apply(ctx, destination, uncompressedStream, opts...)
+	uErr := uncompressedStream.Close()
+	if err == nil && uErr != nil {
+		err = uErr
+	}
+	cErr := rc.Close()
+	if err == nil && cErr != nil {
+		err = cErr
+	}
+	if err != nil {
+		return fmt.Errorf("failed to apply layer %s: %w", layer.Digest, err)
+	}
+
+	for _, hl := range hardlinks {
+		if err := os.MkdirAll(filepath.Dir(hl.NewPath), 0755); err != nil {
+			return fmt.Errorf("failed to create directory for hardlink: %w", err)
+		}
+		if err := os.Link(hl.OldPath, hl.NewPath); err != nil {
+			return fmt.Errorf("failed to create hardlink %s -> %s: %w", hl.OldPath, hl.NewPath, err)
+		}
+	}
+
+	return nil
 }
 
 // whiteoutFunc tracks whiteout files and opaque paths as seen, so they are not extracted
