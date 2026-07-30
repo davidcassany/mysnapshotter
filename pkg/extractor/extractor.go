@@ -20,6 +20,7 @@ import (
 	"archive/tar"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -31,19 +32,42 @@ import (
 	"github.com/containerd/containerd/v2/pkg/archive"
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
 	"github.com/containerd/platforms"
+	"github.com/davidcassany/ocistore/pkg/filedb"
 	"github.com/davidcassany/ocistore/pkg/logger"
 	"github.com/davidcassany/ocistore/pkg/ocistore"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
+const DefaultDBPath = ocistore.DefaultRoot + "/files.db"
+
 type Extractor struct {
-	ctx      context.Context
-	log      logger.Logger
-	platform platforms.MatchComparer
+	ctx        context.Context
+	log        logger.Logger
+	platform   platforms.MatchComparer
+	fileDbPath string
 }
 
-func NewExtractor(ctx context.Context, log logger.Logger) Extractor {
-	return Extractor{log: log, platform: platforms.DefaultStrict(), ctx: ctx}
+type ExtractorOpt func(e *Extractor)
+
+func WithDBPath(path string) ExtractorOpt {
+	return func(e *Extractor) {
+		e.fileDbPath = path
+	}
+}
+
+func NewExtractor(ctx context.Context, log logger.Logger, opts ...ExtractorOpt) *Extractor {
+	e := &Extractor{
+		log:        log,
+		platform:   platforms.DefaultStrict(),
+		ctx:        ctx,
+		fileDbPath: DefaultDBPath,
+	}
+
+	for _, o := range opts {
+		o(e)
+	}
+
+	return e
 }
 
 type metadata struct {
@@ -57,8 +81,8 @@ type Hardlink struct {
 	NewPath string
 }
 
-func (e Extractor) ExtractImage(imageRef, destination, platformRef string, local bool, verify bool) (string, error) {
-	destination, err := filepath.Abs(destination)
+func (e Extractor) ExtractImage(imageRef, destination, platformRef string, local bool, verify bool) (_ string, err error) {
+	destination, err = filepath.Abs(destination)
 	if err != nil {
 		return "", fmt.Errorf("cannot set destination %q as an absolute path: %w", destination, err)
 	}
@@ -106,6 +130,11 @@ func (e Extractor) ExtractImage(imageRef, destination, platformRef string, local
 
 	seenPaths := map[string]bool{}
 
+	db, err := filedb.Open(e.fileDbPath)
+	if err != nil {
+		return "", fmt.Errorf("creating file database: %w", err)
+	}
+
 	for _, layerDesc := range slices.Backward(imgMeta.mfst.Layers) {
 		toc, err := ocistore.FetchToC(e.ctx, fetcher, layerDesc)
 		if err != nil {
@@ -116,6 +145,17 @@ func (e Extractor) ExtractImage(imageRef, destination, platformRef string, local
 
 		if toc == nil {
 			err = fetchAndApplyLayer(e.ctx, fetcher, layerDesc, destination, seenPaths)
+			if err != nil {
+				return "", err
+			}
+		} else {
+			defer func() {
+				if err != nil {
+					err = errors.Join(err, db.RemoveRoot(destination))
+				}
+			}()
+
+			err = fetchAndApplyDeltaLayer(e.ctx, e.log, fetcher, db, toc, layerDesc, destination, seenPaths)
 			if err != nil {
 				return "", err
 			}
@@ -185,6 +225,17 @@ func whiteoutFunc(seenPaths map[string]bool) func(hdr *tar.Header, path string) 
 	}
 }
 
+func isParentWhiteout(seenPaths map[string]bool, path string) bool {
+	dir := filepath.Dir(path)
+	for dir != "." && dir != "/" && dir != "" {
+		if val, ok := seenPaths[dir]; val && ok {
+			return true
+		}
+		dir = filepath.Dir(dir)
+	}
+	return false
+}
+
 // filterFunc prevents to extract files that are included in the extracted cache and feeds the extracted cache with files being extracted.
 // It also intercepts all hardlinks for later processing
 func filterFunc(destination string, seenPaths map[string]bool, hardlinks []Hardlink) func(hdr *tar.Header) (bool, error) {
@@ -200,19 +251,8 @@ func filterFunc(destination string, seenPaths map[string]bool, hardlinks []Hardl
 			return true, nil
 		}
 
-		isParentWhiteout := func(path string) bool {
-			dir := filepath.Dir(path)
-			for dir != "." && dir != "/" && dir != "" {
-				if val, ok := seenPaths[dir]; val && ok {
-					return true
-				}
-				dir = filepath.Dir(dir)
-			}
-			return false
-		}
-
 		// omit if previously seen from an upper layer
-		if seenPaths[relPath] || isParentWhiteout(relPath) {
+		if seenPaths[relPath] || isParentWhiteout(seenPaths, relPath) {
 			return false, nil
 		}
 

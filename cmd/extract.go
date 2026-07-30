@@ -41,12 +41,16 @@ var extractCmd = &cobra.Command{
 		ref := args[0]
 		dst := args[1]
 
-		extract := extractor.NewExtractor(context.Background(), log)
+		flags := cmd.Flags()
+		filedb, _ := flags.GetString("filedb")
+
+		extract := extractor.NewExtractor(context.Background(), log, extractor.WithDBPath(filedb))
 		_, err := extract.ExtractImage(ref, dst, "", false, false)
 		return err
 	},
 }
 
 func init() {
+	rootCmd.PersistentFlags().String("filedb", extractor.DefaultDBPath, "path for the local files database")
 	rootCmd.AddCommand(extractCmd)
 }

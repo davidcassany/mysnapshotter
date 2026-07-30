@@ -18,6 +18,7 @@ package filedb
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 
 	bolt "go.etcd.io/bbolt"
@@ -45,7 +46,12 @@ type DB struct {
 //	  <root>/           sub-bucket per extraction root directory
 //	    <relPath> → <digest>  reverse index used by RemoveRoot
 func Open(path string) (*DB, error) {
-	db, err := bolt.Open(path, 0600, nil)
+	err := os.MkdirAll(filepath.Dir(path), 0o755)
+	if err != nil {
+		return nil, fmt.Errorf("creating the path for files database %q: %w", path, err)
+	}
+
+	db, err := bolt.Open(path, 0644, nil)
 	if err != nil {
 		return nil, fmt.Errorf("opening filedb: %w", err)
 	}
@@ -67,11 +73,11 @@ func (d *DB) Close() error {
 	return d.db.Close()
 }
 
-// Entry pairs a content digest with the relative path of an extracted file,
+// Entry pairs a content digest with the relative paths of extracted files,
 // matching the Digest and Name fields of chunked.FileMetadata.
-type Entry struct {
-	Digest  string // "sha256:<hex>"; entries with an empty digest are skipped
-	RelPath string // path within the layer, i.e. FileMetadata.Name
+type Entry interface {
+	Digest() string
+	RelPaths() []string
 }
 
 // RecordAll records all entries from a single layer extraction under root in
@@ -88,20 +94,26 @@ func (d *DB) RecordAll(root string, entries []Entry) error {
 		}
 
 		for _, e := range entries {
-			if e.Digest == "" {
+			if e.Digest() == "" {
 				continue
 			}
-			absPath := filepath.Join(root, e.RelPath)
 
-			sb, err := cb.CreateBucketIfNotExists([]byte(e.Digest))
+			sb, err := cb.CreateBucketIfNotExists([]byte(e.Digest()))
 			if err != nil {
-				return fmt.Errorf("creating checksum bucket for %s: %w", e.Digest, err)
+				return fmt.Errorf("creating checksum bucket for %s: %w", e.Digest(), err)
 			}
-			if err := sb.Put([]byte(absPath), nil); err != nil {
-				return err
-			}
-			if err := rsb.Put([]byte(e.RelPath), []byte(e.Digest)); err != nil {
-				return err
+			for _, rp := range e.RelPaths() {
+				if rp == "" {
+					continue
+				}
+
+				absPath := filepath.Join(root, rp)
+				if err := sb.Put([]byte(absPath), nil); err != nil {
+					return err
+				}
+				if err := rsb.Put([]byte(rp), []byte(e.Digest())); err != nil {
+					return err
+				}
 			}
 		}
 		return nil

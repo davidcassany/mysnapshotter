@@ -8,6 +8,19 @@ import (
 	"github.com/davidcassany/ocistore/pkg/filedb"
 )
 
+type entry struct {
+	digest   string
+	relPaths []string
+}
+
+func (e entry) Digest() string {
+	return e.digest
+}
+
+func (e entry) RelPaths() []string {
+	return e.relPaths
+}
+
 func openTemp(t *testing.T) *filedb.DB {
 	t.Helper()
 	db, err := filedb.Open(filepath.Join(t.TempDir(), "filedb.bolt"))
@@ -34,10 +47,9 @@ func TestRecordAll_and_PathsForChecksum(t *testing.T) {
 
 	root := "/extractions/root1"
 	entries := []filedb.Entry{
-		{Digest: "sha256:aaa", RelPath: "usr/bin/foo"},
-		{Digest: "sha256:bbb", RelPath: "usr/lib/bar.so"},
-		{Digest: "", RelPath: "usr/share/doc"},   // directory — no digest, must be skipped
-		{Digest: "sha256:aaa", RelPath: "usr/bin/foo2"}, // same digest, different path
+		&entry{digest: "sha256:aaa", relPaths: []string{"usr/bin/foo", "usr/bin/foo2"}}, // Includes duplicates
+		&entry{digest: "sha256:bbb", relPaths: []string{"usr/lib/bar.so"}},
+		&entry{digest: "", relPaths: []string{"usr/share/doc"}}, // directory — no digest, must be skipped
 	}
 
 	if err := db.RecordAll(root, entries); err != nil {
@@ -77,13 +89,13 @@ func TestRemoveRoot_cleansUpOrphanDigests(t *testing.T) {
 	onlyRoot1 := "sha256:only1"
 
 	if err := db.RecordAll(root1, []filedb.Entry{
-		{Digest: sharedDigest, RelPath: "usr/bin/foo"},
-		{Digest: onlyRoot1, RelPath: "usr/lib/private.so"},
+		&entry{digest: sharedDigest, relPaths: []string{"usr/bin/foo"}},
+		&entry{digest: onlyRoot1, relPaths: []string{"usr/lib/private.so"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.RecordAll(root2, []filedb.Entry{
-		{Digest: sharedDigest, RelPath: "usr/bin/foo"},
+		&entry{digest: sharedDigest, relPaths: []string{"usr/bin/foo"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -132,8 +144,8 @@ func TestRemoveRoot_allRoots_clearsAllDigests(t *testing.T) {
 	root2 := "/extractions/root2"
 	digest := "sha256:abc"
 
-	db.RecordAll(root1, []filedb.Entry{{Digest: digest, RelPath: "bin/x"}})
-	db.RecordAll(root2, []filedb.Entry{{Digest: digest, RelPath: "bin/x"}})
+	db.RecordAll(root1, []filedb.Entry{&entry{digest: digest, relPaths: []string{"bin/x"}}})
+	db.RecordAll(root2, []filedb.Entry{&entry{digest: digest, relPaths: []string{"bin/x"}}})
 
 	db.RemoveRoot(root1)
 	db.RemoveRoot(root2)
