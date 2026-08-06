@@ -43,14 +43,19 @@ var extractCmd = &cobra.Command{
 
 		flags := cmd.Flags()
 		filedb, _ := flags.GetString("filedb")
+		skipTLS, _ := flags.GetBool("skip-tls")
+		delta, _ := flags.GetBool("delta")
 
-		extract := extractor.NewExtractor(context.Background(), log, extractor.WithDBPath(filedb))
-		_, err := extract.ExtractImage(ref, dst, "", false, false)
+		extract := extractor.NewExtractor(context.Background(), log, extractor.WithDBPath(filedb), extractor.WithDelta(delta))
+		_, err := extract.ExtractImage(ref, dst, "", false, !skipTLS)
 		return err
 	},
 }
 
 func init() {
-	rootCmd.PersistentFlags().String("filedb", extractor.DefaultDBPath, "path for the local files database")
 	rootCmd.AddCommand(extractCmd)
+
+	extractCmd.Flags().String("filedb", extractor.DefaultDBPath, "path for the local files database")
+	extractCmd.Flags().Bool("skip-tls", false, "Skip TLS verification")
+	extractCmd.Flags().Bool("delta", true, "Attempt to only fetch non cached files. Only changes the behavior for zstd-chunked images")
 }

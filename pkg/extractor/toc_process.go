@@ -19,7 +19,6 @@ package extractor
 import (
 	"path/filepath"
 	"sort"
-	"strings"
 
 	"github.com/davidcassany/ocistore/pkg/chunked"
 	"github.com/davidcassany/ocistore/pkg/filedb"
@@ -89,7 +88,7 @@ func (t *tocFile) RelPaths() []string {
 	return paths
 }
 
-func processTOC(log logger.Logger, bdb *filedb.DB, toc *chunked.TOC, seenPaths map[string]bool) *processedTOC {
+func processTOC(log logger.Logger, bdb *filedb.DB, toc *chunked.TOC, lCtx *layerCtx) *processedTOC {
 	//var active *tocFile
 	var missing, cached []*tocFile
 	var structure []*chunked.FileMetadata
@@ -109,19 +108,20 @@ func processTOC(log logger.Logger, bdb *filedb.DB, toc *chunked.TOC, seenPaths m
 			continue
 		}
 
-		// if the path is already processed omit it
-		_, seen := seenPaths[entry.Name]
-		if seen || isParentWhiteout(seenPaths, entry.Name) {
+		relPath := filepath.Clean(entry.Name)
+
+		// filter whiteouts
+		if filterWhiteout(lCtx, relPath) || isParentWhiteout(lCtx.whiteouts, relPath) {
 			continue
 		}
 
-		// filter whiteouts
-		if handleWhiteouts(seenPaths, entry) {
+		// omit if previously seen from an upper layer
+		if lCtx.seenPaths[relPath] {
 			continue
 		}
 
 		// Ensure we won't extract this file again on follow up layers
-		seenPaths[entry.Name] = entry.Type != chunked.TypeDir
+		lCtx.seenPaths[relPath] = true
 
 		var tf *tocFile
 
@@ -179,6 +179,9 @@ func processTOC(log logger.Logger, bdb *filedb.DB, toc *chunked.TOC, seenPaths m
 		}
 	}
 
+	// Ensure opaques are honored in any follow up layer
+	lCtx.applyOpaques()
+
 	log.Debugf("collected %d missing files", len(missing))
 	log.Debugf("collected %d cached files", len(cached))
 	log.Debugf("collected %d structural nodes", len(structure))
@@ -188,21 +191,6 @@ func processTOC(log logger.Logger, bdb *filedb.DB, toc *chunked.TOC, seenPaths m
 		cachedFiles:  cached,
 		structure:    structure,
 	}
-}
-
-func handleWhiteouts(seenPaths map[string]bool, entry chunked.FileMetadata) (skip bool) {
-	baseName := filepath.Base(entry.Name)
-	dirName := filepath.Dir(entry.Name)
-	if strings.HasPrefix(baseName, ".wh.") {
-		if baseName == ".wh..wh..opq" {
-			seenPaths[dirName] = true
-		} else {
-			actualFile := filepath.Join(dirName, strings.TrimPrefix(baseName, ".wh."))
-			seenPaths[actualFile] = entry.Type != chunked.TypeDir
-		}
-		return true
-	}
-	return false
 }
 
 func groupMissingFiles(misses []*tocFile) []*byteRangeGroup {

@@ -32,19 +32,26 @@ import (
 	"github.com/containerd/containerd/v2/pkg/archive"
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
 	"github.com/containerd/platforms"
+	"github.com/davidcassany/ocistore/pkg/chunked"
 	"github.com/davidcassany/ocistore/pkg/filedb"
 	"github.com/davidcassany/ocistore/pkg/logger"
 	"github.com/davidcassany/ocistore/pkg/ocistore"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
-const DefaultDBPath = ocistore.DefaultRoot + "/files.db"
+const (
+	DefaultDBPath = ocistore.DefaultRoot + "/files.db"
+
+	whiteout    = ".wh."
+	opqWhiteout = ".wh..wh..opq"
+)
 
 type Extractor struct {
 	ctx        context.Context
 	log        logger.Logger
 	platform   platforms.MatchComparer
 	fileDbPath string
+	delta      bool
 }
 
 type ExtractorOpt func(e *Extractor)
@@ -52,6 +59,12 @@ type ExtractorOpt func(e *Extractor)
 func WithDBPath(path string) ExtractorOpt {
 	return func(e *Extractor) {
 		e.fileDbPath = path
+	}
+}
+
+func WithDelta(delta bool) ExtractorOpt {
+	return func(e *Extractor) {
+		e.delta = delta
 	}
 }
 
@@ -75,10 +88,45 @@ type metadata struct {
 	conf *ocispec.Image
 }
 
-// Hardlink tracks links that must be applied after all layers are extracted
-type Hardlink struct {
-	OldPath string
-	NewPath string
+type layerCtx struct {
+	// seenPaths collects already applied paths, if for a given key path it
+	// is set to false false it is assumed this is not an applied path
+	seenPaths map[string]bool
+
+	// whiteouts collects all whiteouts, opaque or not, if for a given key path
+	// it is set to false it means this is not a whiteout
+	whiteouts map[string]bool
+
+	// pendingOpqs collects all the opaque whiteouts pending to active (e.g.
+	// seen in current layer). Use applyOpaques() method to apply them, this
+	// expected to happen between layers.
+	pendingOpqs []string
+
+	// hardlinks are all links found in layers so they can be created
+	// after extracting them all
+	hardlinks []*hardlink
+}
+
+func newLayerCtx() *layerCtx {
+	return &layerCtx{
+		seenPaths:   map[string]bool{},
+		whiteouts:   map[string]bool{},
+		pendingOpqs: []string{},
+		hardlinks:   []*hardlink{},
+	}
+}
+
+func (lc *layerCtx) applyOpaques() {
+	for _, opq := range lc.pendingOpqs {
+		lc.whiteouts[opq] = true
+	}
+	lc.pendingOpqs = []string{}
+}
+
+// hardlink tracks links that must be applied after all layers are extracted
+type hardlink struct {
+	old string
+	new string
 }
 
 func (e Extractor) ExtractImage(imageRef, destination, platformRef string, local bool, verify bool) (_ string, err error) {
@@ -128,107 +176,109 @@ func (e Extractor) ExtractImage(imageRef, destination, platformRef string, local
 
 	digest := imgMeta.mfst.Config.Digest.String()
 
-	seenPaths := map[string]bool{}
+	lCtx := newLayerCtx()
 
-	db, err := filedb.Open(e.fileDbPath)
-	if err != nil {
-		return "", fmt.Errorf("creating file database: %w", err)
+	var db *filedb.DB
+	var toc *chunked.TOC
+
+	if e.delta {
+		db, err = filedb.Open(e.fileDbPath)
+		if err != nil {
+			return "", fmt.Errorf("opening file database: %w", err)
+		}
+		if db.RootExists(destination) {
+			return "", fmt.Errorf("cannot extract data to an already cached root: %q", destination)
+		}
+		defer func() {
+			if err != nil {
+				err = errors.Join(err, db.RemoveRoot(destination))
+			}
+		}()
 	}
 
 	for _, layerDesc := range slices.Backward(imgMeta.mfst.Layers) {
-		toc, err := ocistore.FetchToC(e.ctx, fetcher, layerDesc)
-		if err != nil {
-			e.log.Errorf("failed to extract toc: %s", err.Error())
-		} else {
-			e.log.Infof("ToC successfully fetched and parsed! Entries: %d", len(toc.Entries))
+		if e.delta {
+			toc, err = ocistore.FetchToC(e.ctx, fetcher, layerDesc)
+			if err != nil {
+				e.log.Warnf("could not extract ToC: %s. Fallback to regular extraction", err.Error())
+			}
 		}
 
 		if toc == nil {
-			err = fetchAndApplyLayer(e.ctx, fetcher, layerDesc, destination, seenPaths)
+			err = fetchAndApplyLayer(e.ctx, e.log, fetcher, layerDesc, destination, lCtx)
 			if err != nil {
 				return "", err
 			}
 		} else {
-			defer func() {
-				if err != nil {
-					err = errors.Join(err, db.RemoveRoot(destination))
-				}
-			}()
-
-			err = fetchAndApplyDeltaLayer(e.ctx, e.log, fetcher, db, toc, layerDesc, destination, seenPaths)
+			err = fetchAndApplyDeltaLayer(e.ctx, e.log, fetcher, db, toc, layerDesc, destination, lCtx)
 			if err != nil {
 				return "", err
 			}
 		}
+	}
+	err = createHardLinks(lCtx.hardlinks)
+	if err != nil {
+		return "", fmt.Errorf("creating deferred hardlinks: %w", err)
 	}
 
 	return digest, nil
 }
 
-func fetchAndApplyLayer(ctx context.Context, fetcher remotes.Fetcher, layer ocispec.Descriptor, destination string, seenPaths map[string]bool) error {
+func fetchAndApplyLayer(ctx context.Context, log logger.Logger, fetcher remotes.Fetcher, layer ocispec.Descriptor, destination string, lCtx *layerCtx) error {
+	log.Debugf("starting to fetch layer stream")
+
 	rc, err := fetcher.Fetch(ctx, layer)
 	if err != nil {
 		return fmt.Errorf("failed to fetch layer %s: %w", layer.Digest, err)
 	}
 
+	log.Debugf("decompressing layer stream")
+
 	uncompressedStream, err := compression.DecompressStream(rc)
 	if err != nil {
+		_ = rc.Close()
 		return err
 	}
 
-	hardlinks := []Hardlink{}
 	opts := []archive.ApplyOpt{
-		archive.WithFilter(filterFunc(destination, seenPaths, hardlinks)),
-		archive.WithConvertWhiteout(whiteoutFunc(seenPaths)),
+		archive.WithFilter(filterFunc(destination, lCtx)),
 	}
+
+	log.Debug("applying uncompressed stream")
+
 	_, err = archive.Apply(ctx, destination, uncompressedStream, opts...)
-	uErr := uncompressedStream.Close()
-	if err == nil && uErr != nil {
-		err = uErr
-	}
-	cErr := rc.Close()
-	if err == nil && cErr != nil {
-		err = cErr
-	}
+	err = errors.Join(err, uncompressedStream.Close(), rc.Close())
 	if err != nil {
 		return fmt.Errorf("failed to apply layer %s: %w", layer.Digest, err)
 	}
 
-	for _, hl := range hardlinks {
-		if err := os.MkdirAll(filepath.Dir(hl.NewPath), 0755); err != nil {
-			return fmt.Errorf("failed to create directory for hardlink: %w", err)
-		}
-		if err := os.Link(hl.OldPath, hl.NewPath); err != nil {
-			return fmt.Errorf("failed to create hardlink %s -> %s: %w", hl.OldPath, hl.NewPath, err)
-		}
-	}
+	// Ensure opaques are honored in any follow up layer
+	lCtx.applyOpaques()
 
 	return nil
 }
 
-// whiteoutFunc tracks whiteout files and opaque paths as seen, so they are not extracted
-func whiteoutFunc(seenPaths map[string]bool) func(hdr *tar.Header, path string) (bool, error) {
-	return func(hdr *tar.Header, path string) (bool, error) {
-		relPath := filepath.Clean(hdr.Name)
-		baseName := filepath.Base(relPath)
-		dirName := filepath.Dir(relPath)
+func filterWhiteout(lCtx *layerCtx, relPath string) bool {
+	baseName := filepath.Base(relPath)
+	dirName := filepath.Dir(relPath)
 
-		if baseName == ".wh..wh..opq" {
-			seenPaths[dirName] = true
-		} else {
-			actualFile := filepath.Join(dirName, strings.TrimPrefix(baseName, ".wh."))
-			seenPaths[actualFile] = hdr.Typeflag != tar.TypeDir
-		}
-
-		// return false so neither the `.wh.` file is written nor deletion occurs
-		return false, nil
+	if baseName == opqWhiteout {
+		lCtx.pendingOpqs = append(lCtx.pendingOpqs, dirName)
+		return true
+	} else if after, ok := strings.CutPrefix(baseName, whiteout); ok {
+		relPath = filepath.Join(dirName, after)
+		lCtx.seenPaths[relPath] = true
+		lCtx.whiteouts[relPath] = true
+		return true
 	}
+
+	return false
 }
 
-func isParentWhiteout(seenPaths map[string]bool, path string) bool {
+func isParentWhiteout(opaques map[string]bool, path string) bool {
 	dir := filepath.Dir(path)
 	for dir != "." && dir != "/" && dir != "" {
-		if val, ok := seenPaths[dir]; val && ok {
+		if opaques[dir] {
 			return true
 		}
 		dir = filepath.Dir(dir)
@@ -238,36 +288,35 @@ func isParentWhiteout(seenPaths map[string]bool, path string) bool {
 
 // filterFunc prevents to extract files that are included in the extracted cache and feeds the extracted cache with files being extracted.
 // It also intercepts all hardlinks for later processing
-func filterFunc(destination string, seenPaths map[string]bool, hardlinks []Hardlink) func(hdr *tar.Header) (bool, error) {
+func filterFunc(destination string, lCtx *layerCtx) func(hdr *tar.Header) (bool, error) {
 	return func(hdr *tar.Header) (bool, error) {
 		relPath := filepath.Clean(hdr.Name)
 		if relPath == "." || relPath == "/" {
 			return true, nil
 		}
 
-		// allow whiteouts to pass through to the ConvertWhiteout logic
-		baseName := filepath.Base(relPath)
-		if strings.HasPrefix(baseName, ".wh.") {
-			return true, nil
+		// filter whiteouts
+		if filterWhiteout(lCtx, relPath) || isParentWhiteout(lCtx.whiteouts, relPath) {
+			return false, nil
 		}
 
 		// omit if previously seen from an upper layer
-		if seenPaths[relPath] || isParentWhiteout(seenPaths, relPath) {
+		if lCtx.seenPaths[relPath] {
 			return false, nil
 		}
 
 		// mark as seen for subsequent lower layers
-		seenPaths[relPath] = hdr.Typeflag != tar.TypeDir
+		lCtx.seenPaths[relPath] = true
 
 		// intercept hardlinks for deferred processing
 		if hdr.Typeflag == tar.TypeLink {
 			oldpath := filepath.Join(destination, hdr.Linkname)
-			if !strings.HasPrefix(oldpath, destination+string(filepath.Separator)) {
-				return false, fmt.Errorf("illegal hardlink target escapes destination directory: %s", hdr.Linkname)
+			if err := ensureSafePath(destination, oldpath); err != nil {
+				return false, fmt.Errorf("illegal hardlink target: %w", err)
 			}
-			hardlinks = append(hardlinks, Hardlink{
-				NewPath: filepath.Join(destination, relPath),
-				OldPath: oldpath,
+			lCtx.hardlinks = append(lCtx.hardlinks, &hardlink{
+				new: filepath.Join(destination, relPath),
+				old: oldpath,
 			})
 			return false, nil // Skip native extraction
 		}
@@ -275,6 +324,32 @@ func filterFunc(destination string, seenPaths map[string]bool, hardlinks []Hardl
 		// Extract all other unseen files normally
 		return true, nil
 	}
+}
+
+// ensureSafePath checks if the target path is lexically inside the base directory.
+func ensureSafePath(baseDir, targetPath string) error {
+	absBase, err := filepath.Abs(baseDir)
+	if err != nil {
+		return fmt.Errorf("failed to get absolute path of base dir: %v", err)
+	}
+
+	absTarget, err := filepath.Abs(targetPath)
+	if err != nil {
+		return fmt.Errorf("failed to get absolute path of target: %v", err)
+	}
+
+	// Calculate the relative path from base to target
+	rel, err := filepath.Rel(absBase, absTarget)
+	if err != nil {
+		return fmt.Errorf("failed to calculate relative path: %v", err)
+	}
+
+	// If the relative path starts with ".." or is exactly "..", it escapes the base dir
+	if strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
+		return fmt.Errorf("path traversal detected: %s escapes %s", targetPath, baseDir)
+	}
+
+	return nil
 }
 
 func fetchManifestAndConfig(log logger.Logger, fetcher remotes.Fetcher, metadata *metadata) images.HandlerFunc {
@@ -335,4 +410,24 @@ func fetchManifestAndConfig(log logger.Logger, fetcher remotes.Fetcher, metadata
 		}
 		return nil, nil
 	}
+}
+
+func createHardLinks(links []*hardlink) error {
+	for _, link := range links {
+		if link == nil {
+			continue
+		}
+		err := os.Link(link.old, link.new)
+		if err != nil {
+			if os.IsExist(err) {
+				_ = os.Remove(link.new)
+				err = os.Link(link.old, link.new)
+			}
+
+			if err != nil {
+				return fmt.Errorf("creating hardlink %s -> %s: %w", link.new, link.old, err)
+			}
+		}
+	}
+	return nil
 }

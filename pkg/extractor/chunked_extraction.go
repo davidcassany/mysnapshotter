@@ -28,7 +28,6 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
-	"strings"
 
 	"github.com/davidcassany/ocistore/pkg/chunked"
 	"github.com/davidcassany/ocistore/pkg/filedb"
@@ -39,7 +38,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func createStructuralNodes(log logger.Logger, structure []*chunked.FileMetadata, target string) (pending []*chunked.FileMetadata, err error) {
+func createStructuralNodes(log logger.Logger, structure []*chunked.FileMetadata, target string, lCtx *layerCtx) (dirs []*chunked.FileMetadata, err error) {
 	var path string
 
 	// sort paths to ensure we are starting from parent directories
@@ -63,8 +62,9 @@ func createStructuralNodes(log logger.Logger, structure []*chunked.FileMetadata,
 			if n.Size != 0 {
 				log.Warnf("non zero 'reg' entry type found (%s) with size %d, treating it as an empty file", n.Name, n.Size)
 			}
+
 			flags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
-			file, err := os.OpenFile(path, flags, goMode.Perm())
+			file, err := os.OpenFile(path, flags, goMode)
 			if err != nil {
 				return nil, fmt.Errorf("creating file %s: %w", path, err)
 			}
@@ -74,27 +74,21 @@ func createStructuralNodes(log logger.Logger, structure []*chunked.FileMetadata,
 			}
 		case chunked.TypeDir:
 			_, err = os.Stat(path)
-			if err == nil {
-				err = os.Chmod(path, os.FileMode(0700))
-			}
 			if errors.Is(err, fs.ErrNotExist) {
 				err = os.MkdirAll(path, os.FileMode(0700))
+			} else {
+				err = os.Chmod(path, os.FileMode(0700))
 			}
 			if err != nil {
 				return nil, fmt.Errorf("creating directory %s: %w", path, err)
 			}
 			// apply metadata and permissions to directories as the last step
-			pending = append(pending, n)
+			dirs = append(dirs, n)
 			continue
 		case chunked.TypeSymlink:
-			linkname, err := turnSymlinkRelative(target, path, n.Linkname)
+			err = ensureSafePath(target, resolveSymlink(target, path, n.Linkname))
 			if err != nil {
-				return nil, fmt.Errorf("making relative a symlink %q with target %q", path, n.Linkname)
-			}
-
-			err = ensureSafePath(target, resolveSymlink(target, path, linkname))
-			if err != nil {
-				return nil, fmt.Errorf("sanitizing symlink %q with target %q", path, linkname)
+				return nil, fmt.Errorf("sanitizing symlink %q with target %q", path, n.Linkname)
 			}
 
 			err = os.Remove(path)
@@ -102,13 +96,21 @@ func createStructuralNodes(log logger.Logger, structure []*chunked.FileMetadata,
 				return nil, err
 			}
 
-			err = os.Symlink(linkname, path)
+			err = os.Symlink(n.Linkname, path)
 			if err != nil {
-				return nil, fmt.Errorf("creating symlink %s -> %s: %w", path, linkname, err)
+				return nil, fmt.Errorf("creating symlink %s -> %s: %w", path, n.Linkname, err)
 			}
 		case chunked.TypeLink:
-			// apply hardlinks after applying cached and fetched files
-			pending = append(pending, n)
+			// apply hardlinks after applying all layers
+			old := filepath.Join(target, n.Linkname)
+			err = ensureSafePath(target, old)
+			if err != nil {
+				return nil, fmt.Errorf("illegal hardlink target: %w", err)
+			}
+			lCtx.hardlinks = append(lCtx.hardlinks, &hardlink{
+				old: old,
+				new: filepath.Join(target, n.Name),
+			})
 			continue
 		case chunked.TypeChar, chunked.TypeBlock:
 			err = os.Remove(path)
@@ -143,14 +145,22 @@ func createStructuralNodes(log logger.Logger, structure []*chunked.FileMetadata,
 		}
 	}
 
-	return pending, nil
+	return dirs, nil
 }
 
-// applyMetadata sets the UID, GID, MTime and Extended Attributes on a created node
+// applyMetadata sets the UID, GID, permissions, MTime and Extended Attributes on a created node
 func applyMetadata(targetPath string, node *chunked.FileMetadata) error {
 	// If targetPath is a symlink, Lchown changes the symlink itself.
 	if err := os.Lchown(targetPath, node.UID, node.GID); err != nil {
 		return fmt.Errorf("failed to apply Lchown to %s: %w", targetPath, err)
+	}
+
+	// Chmod must come after Lchown: changing ownership clears setuid/setgid bits.
+	// Use unix.Chmod with raw Unix mode bits so setuid/setgid/sticky are preserved.
+	if node.Type != chunked.TypeSymlink {
+		if err := unix.Chmod(targetPath, uint32(node.Mode)&07777); err != nil {
+			return fmt.Errorf("failed to apply chmod to %s: %w", targetPath, err)
+		}
 	}
 
 	if node.ModTime != nil || node.AccessTime != nil {
@@ -201,41 +211,6 @@ func resolveSymlink(baseDir, symlink, linkname string) string {
 	return filepath.Join(baseDir, linkname)
 }
 
-// turnSymlinkRelative converts the target path of the symlink to a relative path for the given baseDir.
-func turnSymlinkRelative(baseDir, symlink, linkname string) (string, error) {
-	if filepath.IsAbs(linkname) {
-		symDir := filepath.Dir(filepath.Join(baseDir, symlink))
-		return filepath.Rel(symDir, filepath.Join(baseDir, linkname))
-	}
-	return linkname, nil
-}
-
-// ensureSafePath checks if the target path is lexically inside the base directory.
-func ensureSafePath(baseDir, targetPath string) error {
-	absBase, err := filepath.Abs(baseDir)
-	if err != nil {
-		return fmt.Errorf("failed to get absolute path of base dir: %v", err)
-	}
-
-	absTarget, err := filepath.Abs(targetPath)
-	if err != nil {
-		return fmt.Errorf("failed to get absolute path of target: %v", err)
-	}
-
-	// Calculate the relative path from base to target
-	rel, err := filepath.Rel(absBase, absTarget)
-	if err != nil {
-		return fmt.Errorf("failed to calculate relative path: %v", err)
-	}
-
-	// If the relative path starts with ".." or is exactly "..", it escapes the base dir
-	if strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
-		return fmt.Errorf("path traversal detected: %s escapes %s", targetPath, baseDir)
-	}
-
-	return nil
-}
-
 func fetchAndApplyBlobRanges(ctx context.Context, log logger.Logger, fetcher ocistore.RangeFetcher, layerDesc ocispec.Descriptor, root string, ranges []*byteRangeGroup) (err error) {
 	var currentStreamPos int64
 
@@ -280,8 +255,9 @@ func fetchAndApplyBlobRanges(ctx context.Context, log logger.Logger, fetcher oci
 }
 
 func decompressFile(log logger.Logger, r io.Reader, zstdFile *tocFile, root string) (err error) {
-	// remove target file if already exists and recreate it as an empty file
 	path := filepath.Join(root, zstdFile.Entry.Name)
+
+	// remove target file if already exists and recreate it as an empty file
 	err = os.Remove(path)
 	if err != nil && !os.IsNotExist(err) {
 		return err
@@ -438,46 +414,27 @@ func reflinkOrCopy(target, source string, entry *chunked.FileMetadata) (err erro
 	return nil
 }
 
-func applyPendingNodes(log logger.Logger, pending []*chunked.FileMetadata, root string) error {
+func applyDirPerm(log logger.Logger, dirs []*chunked.FileMetadata, root string) error {
 	var path string
 	var err error
 
 	// in reverse order to ensure we do not fall in the readonly trap
-	slices.SortFunc(pending, func(a, b *chunked.FileMetadata) int {
+	slices.SortFunc(dirs, func(a, b *chunked.FileMetadata) int {
 		if a == nil || b == nil {
 			return 0
 		}
 		return cmp.Compare(b.Name, a.Name)
 	})
 
-	log.Debugf("starting to apply directory permissions and hardlinks creation. %d items", len(pending))
+	log.Debugf("starting to apply directory permissions. %d items", len(dirs))
 
-	for _, e := range pending {
-		path = filepath.Join(root, e.Name)
-		goMode := os.FileMode(e.Mode)
-		switch e.Type {
-		case "dir":
-			err = os.Chmod(path, goMode.Perm())
-			if err != nil {
-				return fmt.Errorf("setting permissions for directory %s: %w", path, err)
-			}
-		case "hardlink":
-			linkTarget := filepath.Join(root, e.Linkname)
-
-			err = ensureSafePath(root, linkTarget)
-			if err != nil {
-				return fmt.Errorf("sanitazing hardlink: %w", err)
-			}
-
-			err = os.Link(linkTarget, path)
-			if err != nil {
-				return fmt.Errorf("creating hardlink %s -> %s: %w", path, linkTarget, err)
-			}
-		default:
-			log.Warnf("found file of type %s (%s) in pending list, ignoring it", e.Type, path)
+	for _, d := range dirs {
+		path = filepath.Join(root, d.Name)
+		if d.Type != chunked.TypeDir {
+			log.Warnf("found file of type %s (%s) in dirs list, ignoring it", d.Type, path)
 			continue
 		}
-		err = applyMetadata(path, e)
+		err = applyMetadata(path, d)
 		if err != nil {
 			return fmt.Errorf("setting metadata for %s: %w", path, err)
 		}
@@ -503,12 +460,12 @@ func updateFileDB(db *filedb.DB, root string, pToc *processedTOC) error {
 
 func fetchAndApplyDeltaLayer(
 	ctx context.Context, log logger.Logger, fetcher ocistore.RangeFetcher, db *filedb.DB,
-	toc *chunked.TOC, layerDesc ocispec.Descriptor, destination string, seenPaths map[string]bool,
+	toc *chunked.TOC, layerDesc ocispec.Descriptor, destination string, lCtx *layerCtx,
 ) error {
 
-	pToc := processTOC(log, db, toc, seenPaths)
+	pToc := processTOC(log, db, toc, lCtx)
 
-	p, err := createStructuralNodes(log, pToc.structure, destination)
+	dirs, err := createStructuralNodes(log, pToc.structure, destination, lCtx)
 	if err != nil {
 		return fmt.Errorf("creating structural nodes: %w", err)
 	}
@@ -523,9 +480,9 @@ func fetchAndApplyDeltaLayer(
 		return fmt.Errorf("applying cached files: %w", err)
 	}
 
-	err = applyPendingNodes(log, p, destination)
+	err = applyDirPerm(log, dirs, destination)
 	if err != nil {
-		return fmt.Errorf("applying final metadata and links: %w", err)
+		return fmt.Errorf("applying metadata to directories: %w", err)
 	}
 
 	err = updateFileDB(db, destination, pToc)

@@ -137,6 +137,21 @@ func (d *DB) PathsForChecksum(digest string) ([]string, error) {
 	return paths, err
 }
 
+// RootExists returns true if the root bucket for the given root already exists.
+// It can be used to verify if the given root is already tracked.
+func (d *DB) RootExists(root string) bool {
+	var found bool
+	_ = d.db.View(func(tx *bolt.Tx) error {
+		rsb := tx.Bucket(bktRoots).Bucket([]byte(root))
+		if rsb == nil {
+			return nil
+		}
+		found = true
+		return nil
+	})
+	return found
+}
+
 // RemoveRoot deletes all records for the given extraction root and
 // garbage-collects any digest entries that are no longer referenced by any path.
 // It is a no-op when root has never been recorded.
