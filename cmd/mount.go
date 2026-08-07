@@ -17,7 +17,7 @@ limitations under the License.
 package cmd
 
 import (
-	"github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/images"
 	"github.com/davidcassany/ocistore/pkg/ocistore"
 	"github.com/spf13/cobra"
 )
@@ -37,7 +37,7 @@ var mountCmd = &cobra.Command{
 		scratch, _ := flags.GetBool("from-scratch")
 		target := args[0]
 
-		var img client.Image
+		var img *images.Image
 		var err error
 
 		if scratch {
@@ -54,7 +54,7 @@ var mountCmd = &cobra.Command{
 			mOpts = append(mOpts, ocistore.WithMountUnpack())
 		}
 
-		img, err = cs.Get(name)
+		img, err = cs.Get(cs.Ctx(), name)
 		if err != nil {
 			return err
 		}
@@ -63,7 +63,7 @@ var mountCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		cs.Logger().Infof("Createad mount from '%s' with key: %s", img.Name(), key)
+		cs.Logger().Infof("Createad mount from '%s' with key: %s", img.Name, key)
 		return nil
 	},
 }

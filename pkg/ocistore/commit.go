@@ -26,7 +26,6 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/diff"
 	"github.com/containerd/containerd/v2/core/images"
@@ -106,7 +105,7 @@ func WithImgCommitOpts(iOpts ImgOpts) CommitImgOpt {
 	}
 }
 
-func (c *OCIStore) Commit(snapshotKey string, opts ...CommitImgOpt) (_ client.Image, retErr error) {
+func (c *OCIStore) Commit(snapshotKey string, opts ...CommitImgOpt) (_ *images.Image, err error) {
 	if !c.IsInitiated() {
 		return nil, errors.New(missInitErrMsg)
 	}
@@ -125,20 +124,18 @@ func (c *OCIStore) Commit(snapshotKey string, opts ...CommitImgOpt) (_ client.Im
 		}
 	}
 
-	sn := c.cli.SnapshotService(c.driver)
-	differ := c.cli.DiffService()
-	cs := c.cli.ContentStore()
+	sn := c.snaps[c.driver]
 
 	// TODO which is the dirty data to clean?
 	// Don't gc me and clean the dirty data after 1 hour!
-	ctx, done, err := c.cli.WithLease(c.ctx, leases.WithRandomID(), leases.WithExpiration(1*time.Hour))
+	ctx, done, err := c.WithLease(leases.WithRandomID(), leases.WithExpiration(1*time.Hour))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create lease for commit: %w", err)
 	}
 	defer func() {
-		err = done(ctx)
-		if err != nil && retErr == nil {
-			c.log.Warnf("could not remove lease on update image operation")
+		e := done(ctx)
+		if e != nil && err == nil {
+			err = e
 		}
 	}()
 
@@ -151,17 +148,16 @@ func (c *OCIStore) Commit(snapshotKey string, opts ...CommitImgOpt) (_ client.Im
 	var baseMfst *ocispec.Manifest
 
 	if imgRef, ok := info.Labels[LabelSnapshotImgRef]; ok {
-		baseImage, err := c.cli.GetImage(ctx, imgRef)
+		baseImage, err := c.is.Get(ctx, imgRef)
+		if err != nil {
+			return nil, err
+		}
+		baseImgConfig, _, err = c.ReadImageConfig(ctx, baseImage)
 		if err != nil {
 			return nil, err
 		}
 
-		baseImgConfig, _, err = ReadImageConfig(ctx, baseImage)
-		if err != nil {
-			return nil, err
-		}
-
-		baseMfst, _, err = ReadManifest(ctx, baseImage)
+		baseMfst, _, err = c.ReadManifest(ctx, baseImage)
 		if err != nil {
 			return nil, err
 		}
@@ -169,7 +165,7 @@ func (c *OCIStore) Commit(snapshotKey string, opts ...CommitImgOpt) (_ client.Im
 
 	// TODO ensure all content for baseImage
 
-	diffLayerDesc, diffID, err := createDiff(ctx, snapshotKey, sn, c.cli.ContentStore(), differ, cOpt.dOpts...)
+	diffLayerDesc, diffID, err := createDiff(ctx, snapshotKey, sn, c.cs, c.ds, cOpt.dOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to export layer: %w", err)
 	}
@@ -180,12 +176,12 @@ func (c *OCIStore) Commit(snapshotKey string, opts ...CommitImgOpt) (_ client.Im
 	}
 
 	rootfsID := identity.ChainID(imageConfig.RootFS.DiffIDs).String()
-	if err := applyDiffLayer(ctx, rootfsID, snapshotKey, sn, differ, diffLayerDesc); err != nil {
+	if err := applyDiffLayer(ctx, rootfsID, snapshotKey, sn, c.ds, diffLayerDesc); err != nil {
 		return nil, fmt.Errorf("failed to apply diff: %w", err)
 	}
 
 	// TODO shall we keep the configDigest for something?
-	commitManifestDesc, _, err := writeContentsForImage(ctx, cs, c.driver, baseMfst, imageConfig, diffLayerDesc)
+	commitManifestDesc, _, err := writeContentsForImage(ctx, c.cs, c.driver, baseMfst, imageConfig, diffLayerDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -203,25 +199,24 @@ func (c *OCIStore) Commit(snapshotKey string, opts ...CommitImgOpt) (_ client.Im
 		Labels:    imgLabels,
 	}
 
-	if _, err := c.cli.ImageService().Update(ctx, img); err != nil {
+	if _, err := c.is.Update(ctx, img); err != nil {
 		if !errdefs.IsNotFound(err) {
 			return nil, err
 		}
 
-		if _, err := c.cli.ImageService().Create(ctx, img); err != nil {
+		if _, err := c.is.Create(ctx, img); err != nil {
 			return nil, fmt.Errorf("failed to create new image %s: %w", cOpt.iOpts.Ref, err)
 		}
 	}
 
 	// unpack the image to snapshotter
-	cimg := client.NewImage(c.cli, img)
-	if err := c.unpack(ctx, cimg); err != nil {
+	if err := c.unpack(ctx, &img); err != nil {
 		return nil, err
 	}
 
-	c.log.Infof("Successfully committed image '%s'", cimg.Name())
+	c.log.Infof("Successfully committed image '%s'", img.Name)
 	// TODO should we run a snapshotter cleanup at this point?
-	return cimg, nil
+	return &img, nil
 }
 
 // createDiff creates a layer diff into containerd's content store.

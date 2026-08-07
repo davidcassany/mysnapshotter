@@ -45,9 +45,9 @@ var listCmd = &cobra.Command{
 
 		for _, img := range imgs {
 			if !jOut {
-				fmt.Fprintf(tw, "\t%s\t%s\n", img.Name(), img.Metadata().Target.Digest)
+				fmt.Fprintf(tw, "\t%s\t%s\n", img.Name, img.Target.Digest)
 			} else {
-				images = append(images, img.Metadata())
+				images = append(images, img)
 			}
 		}
 

@@ -20,7 +20,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"time"
 
+	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/errdefs"
 )
@@ -30,7 +33,7 @@ func (c *OCIStore) ListSnapshots(filters ...string) (_ []snapshots.Info, retErr 
 		return nil, errors.New(missInitErrMsg)
 	}
 
-	ctx, done, err := c.cli.WithLease(c.ctx)
+	ctx, done, err := c.WithLease(leases.WithRandomID(), leases.WithExpiration(1*time.Hour))
 	if err != nil {
 		c.log.Errorf("failed to create lease to list snapshots: %v", err)
 		return nil, err
@@ -42,7 +45,7 @@ func (c *OCIStore) ListSnapshots(filters ...string) (_ []snapshots.Info, retErr 
 		}
 	}()
 
-	sn := c.cli.SnapshotService(c.driver)
+	sn := c.GetSnapshotter(c.GetDriver())
 
 	infos, err := listSnapshots(ctx, sn, filters...)
 	if err != nil && errdefs.IsNotFound(err) {
@@ -59,7 +62,7 @@ func (c *OCIStore) GetSnapshot(key string) (_ snapshots.Info, retErr error) {
 		return info, errors.New(missInitErrMsg)
 	}
 
-	ctx, done, err := c.cli.WithLease(c.ctx)
+	ctx, done, err := c.WithLease(leases.WithRandomID(), leases.WithExpiration(1*time.Hour))
 	if err != nil {
 		c.log.Errorf("failed to create lease to get snapshot: %v", err)
 		return info, err
@@ -71,7 +74,7 @@ func (c *OCIStore) GetSnapshot(key string) (_ snapshots.Info, retErr error) {
 		}
 	}()
 
-	sn := c.cli.SnapshotService(c.driver)
+	sn := c.GetSnapshotter(c.GetDriver())
 	return sn.Stat(c.ctx, key)
 }
 
@@ -80,7 +83,7 @@ func (c *OCIStore) UpdateSnapshot(info snapshots.Info, fieldpaths ...string) (_ 
 		return info, errors.New(missInitErrMsg)
 	}
 
-	ctx, done, err := c.cli.WithLease(c.ctx)
+	ctx, done, err := c.WithLease(leases.WithRandomID(), leases.WithExpiration(1*time.Hour))
 	if err != nil {
 		c.log.Errorf("failed to create lease to update snapshot: %v", err)
 		return info, err
@@ -107,7 +110,7 @@ func (c *OCIStore) LabelSnapshot(name string, labels map[string]string) (retErr 
 		return errors.New(missInitErrMsg)
 	}
 
-	ctx, done, err := c.cli.WithLease(c.ctx)
+	ctx, done, err := c.WithLease(leases.WithRandomID(), leases.WithExpiration(1*time.Hour))
 	if err != nil {
 		c.log.Errorf("failed to create lease to get snapshot: %v", err)
 		return err
@@ -119,7 +122,7 @@ func (c *OCIStore) LabelSnapshot(name string, labels map[string]string) (retErr 
 		}
 	}()
 
-	sn := c.cli.SnapshotService(c.driver)
+	sn := c.GetSnapshotter(c.GetDriver())
 	info, err := sn.Stat(ctx, name)
 	if err != nil {
 		return err
@@ -140,7 +143,7 @@ func (c *OCIStore) RemoveSnapshotLabels(name string, labelKeys ...string) (retEr
 		return errors.New(missInitErrMsg)
 	}
 
-	ctx, done, err := c.cli.WithLease(c.ctx)
+	ctx, done, err := c.WithLease(leases.WithRandomID(), leases.WithExpiration(1*time.Hour))
 	if err != nil {
 		c.log.Errorf("failed to create lease to get snapshot: %v", err)
 		return err
@@ -152,7 +155,7 @@ func (c *OCIStore) RemoveSnapshotLabels(name string, labelKeys ...string) (retEr
 		}
 	}()
 
-	sn := c.cli.SnapshotService(c.driver)
+	sn := c.GetSnapshotter(c.GetDriver())
 	info, err := sn.Stat(ctx, name)
 	if err != nil {
 		return err
@@ -214,7 +217,7 @@ func (c *OCIStore) removeSnapshotsChain(ctx context.Context, s snapshots.Snapsho
 }
 
 func (c *OCIStore) updateSnapshot(ctx context.Context, info snapshots.Info, fieldpaths ...string) (snapshots.Info, error) {
-	sn := c.cli.SnapshotService(c.driver)
+	sn := c.GetSnapshotter(c.GetDriver())
 	return sn.Update(ctx, info, fieldpaths...)
 }
 
@@ -232,14 +235,9 @@ func (c *OCIStore) removeSnapshotLabels(ctx context.Context, info snapshots.Info
 }
 
 func (c *OCIStore) labelSnapshot(ctx context.Context, info snapshots.Info, labels map[string]string) (snapshots.Info, error) {
-	sLabels := info.Labels
-	if sLabels == nil {
-		sLabels = map[string]string{}
+	if info.Labels == nil {
+		info.Labels = map[string]string{}
 	}
-	for k, v := range labels {
-		sLabels[k] = v
-	}
-	info.Labels = sLabels
-
+	maps.Copy(info.Labels, labels)
 	return c.updateSnapshot(ctx, info)
 }
